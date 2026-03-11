@@ -1,0 +1,10 @@
+/*
+!/src/
+/src/*
+!*.cc
+!*.h
+!*.ned
+!*.ini
+!*.msg
+!.gitignore
+!readme.md

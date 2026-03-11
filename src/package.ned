@@ -1,0 +1,3 @@
+package uavswarmta;
+
+@license(LGPL);
