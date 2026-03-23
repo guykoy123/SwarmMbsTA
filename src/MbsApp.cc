@@ -2,30 +2,29 @@
  * MbsApp.cc
  *
  *  Created on: Mar 7, 2026
- *      Author: Guy Koyfman
+ *      Author: Guy Koyfman & Omer
  */
 
 #include "MbsApp.h"
 #include "inet/common/Protocol.h"
 #include "inet/common/ProtocolTag_m.h"
 
-
-
+// השורה הזו הייתה חסרה והיא קריטית כדי ש-OMNeT++ יזהה את המחלקה!
+Define_Module(uavswarmta::MbsApp);
 
 namespace uavswarmta {
-Define_Module(MbsApp);
-
 
 void MbsApp::initialize(int stage) {
+    // שלב 0 - הגדרות בסיסיות של התחנה
     if (stage == inet::INITSTAGE_LOCAL) {
         mbsId = getParentModule()->getIndex();
         mobility = check_and_cast<inet::IMobility *>(getParentModule()->getSubmodule("mobility"));
-
+    }
+    // שלב 3 - הרשת באוויר, אפשר לפתוח פורטים (UDP)
+    else if (stage == inet::INITSTAGE_APPLICATION_LAYER) {
         socket.setOutputGate(gate("socketOut"));
 
-        // YES, use this now. The headers above make "inet::Protocol::udp" visible.
-        // This is what prevents the "Unknown Protocol" crash at runtime.
-//        socket.setProtocol(&inet::Protocol::udp);
+        // socket.setProtocol(&inet::Protocol::udp); // השורה נשארת בהערה כפי שביקש הקומפיילר
 
         socket.bind(par("localPort"));
         socket.setCallback(this);
@@ -40,6 +39,7 @@ void MbsApp::handleMessage(cMessage *msg) {
         delete msg;
     }
 }
+
 void MbsApp::assignInitialTask(int taskId, double targetX, double targetY) {
     assignedTasks.push_back(taskId);
     shiftPosition(targetX, targetY);
@@ -62,8 +62,6 @@ void MbsApp::removeTask(int taskId) {
 
 void MbsApp::shiftPosition(double newX, double newY) {
     targetPos = inet::Coord(newX, newY, 0);
-
-
 
     EV << "MBS " << mbsId << " shifting to (" << newX << ", " << newY
        << ") to cover " << assignedTasks.size() << " active tasks.\n";
