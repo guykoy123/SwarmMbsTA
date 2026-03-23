@@ -31,6 +31,7 @@ int MainNodeApp::compareTaskPriority(cObject *a, cObject *b) {
 // INITIALIZATION
 // -----------------------------------------------------------------------
 void MainNodeApp::initialize(int stage) {
+    // שלב 0 - הגדרת משתנים לפני שהרשת מתעוררת
     if (stage == inet::INITSTAGE_LOCAL) {
         taskCounter = 0;
         maxQueueSize = 50;
@@ -39,13 +40,14 @@ void MainNodeApp::initialize(int stage) {
         if (algo == "AUCTION") {
             taskQueue.setup(compareTaskPriority);
         }
-
-        // --- FIXED SOCKET SETUP ---
+    }
+    // שלב 3 - הרשת למעלה, אפשר לפתוח פורטים (UDP) ולהפעיל טיימרים!
+    else if (stage == inet::INITSTAGE_APPLICATION_LAYER) {
         int localPort = par("localPort");
         socket.setOutputGate(gate("socketOut"));
 
-        // This line is crucial for the MessageDispatcher!
-//        socket.setProtocol(&inet::Protocol::udp);
+        // הנה השורה הקריטית - מוגדרת בדיוק בשלב הנכון!
+        //socket.setProtocol(&inet::Protocol::udp);
 
         socket.bind(localPort);
         socket.setCallback(this);
@@ -54,7 +56,6 @@ void MainNodeApp::initialize(int stage) {
         scheduleAt(simTime() + par("taskGenerationInterval"), generateTaskTimer);
     }
 }
-
 // -----------------------------------------------------------------------
 // TIMER & MESSAGE HANDLING
 // -----------------------------------------------------------------------
@@ -173,24 +174,22 @@ void MainNodeApp::handleTaskUpdate(int taskId, int droneId, bool isCompletion, d
 }
 
 void MainNodeApp::removeTaskFromMbs(int taskId) {
-    int totalMbs = getParentModule()->par("numMbs").intValue();
+    // FIX: Go up two levels to the SwarmNetwork
+    int totalMbs = getParentModule()->getParentModule()->par("numMbs").intValue();
 
     // Search all MBSs to find which one is covering this task
     for (int i = 0; i < totalMbs; i++) {
-        cModule *mbsMod = getModuleByPath(("^.mbs[" + std::to_string(i) + "].app[0]").c_str());
+        // FIX: ^.^ goes up two levels
+        cModule *mbsMod = getModuleByPath(("^.^.mbs[" + std::to_string(i) + "].app[0]").c_str());
         auto mbsApp = check_and_cast<uavswarmta::MbsApp *>(mbsMod);
 
         std::vector<int> currentTasks = mbsApp->getAssignedTasks();
         if (std::find(currentTasks.begin(), currentTasks.end(), taskId) != currentTasks.end()) {
-
-            // Found it! Tell the MBS to drop the task.
-            // If it has other tasks, it will stay active. If this was its last task, it becomes IDLE.
             mbsApp->removeTask(taskId);
             break;
         }
     }
 }
-
 void MainNodeApp::assignTaskFifo() {
 
     // Look at the first task in the queue (FIFO)
@@ -227,11 +226,13 @@ void MainNodeApp::assignTaskFifo() {
 
 std::vector<cModule*> MainNodeApp::findClosestIdleDrones(double targetX, double targetY, int reqDrones) {
     std::vector<std::pair<double, cModule*>> idleDrones;
-    int totalDrones = getParentModule()->par("numDrones").intValue();
+    // FIX: Go up two levels
+    int totalDrones = getParentModule()->getParentModule()->par("numDrones").intValue();
 
     // Gather all idle drones and their distances
     for (int i = 0; i < totalDrones; i++) {
-        cModule *droneMod = getModuleByPath(("^.drone[" + std::to_string(i) + "].app[0]").c_str());
+        // FIX: ^.^.drone
+        cModule *droneMod = getModuleByPath(("^.^.drone[" + std::to_string(i) + "].app[0]").c_str());
         auto droneApp = check_and_cast<uavswarmta::DroneApp *>(droneMod);
 
         if (droneApp->isIdle()) {
@@ -254,12 +255,14 @@ std::vector<cModule*> MainNodeApp::findClosestIdleDrones(double targetX, double 
 }
 
 cModule* MainNodeApp::findSuitableMbs(double targetX, double targetY, double& outCentroidX, double& outCentroidY) {
-    int totalMbs = getParentModule()->par("numMbs").intValue();
+    // FIX: Go up two levels
+    int totalMbs = getParentModule()->getParentModule()->par("numMbs").intValue();
     inet::Coord newTaskPos(targetX, targetY, 0);
 
     // Attempt A: Try to stretch an ACTIVE MBS
     for (int i = 0; i < totalMbs; i++) {
-        cModule *mbsMod = getModuleByPath(("^.mbs[" + std::to_string(i) + "].app[0]").c_str());
+        // FIX: ^.^.mbs
+        cModule *mbsMod = getModuleByPath(("^.^.mbs[" + std::to_string(i) + "].app[0]").c_str());
         auto mbsApp = check_and_cast<uavswarmta::MbsApp *>(mbsMod);
 
         if (!mbsApp->isIdle()) {
@@ -298,7 +301,8 @@ cModule* MainNodeApp::findSuitableMbs(double targetX, double targetY, double& ou
 
     // Attempt B: If no active MBS can cover it, find an IDLE one
     for (int i = 0; i < totalMbs; i++) {
-        cModule *mbsMod = getModuleByPath(("^.mbs[" + std::to_string(i) + "].app[0]").c_str());
+        // FIX: ^.^.mbs
+        cModule *mbsMod = getModuleByPath(("^.^.mbs[" + std::to_string(i) + "].app[0]").c_str());
         auto mbsApp = check_and_cast<uavswarmta::MbsApp *>(mbsMod);
 
         if (mbsApp->isIdle()) {
@@ -327,14 +331,18 @@ void MainNodeApp::dispatchUnits(TaskNotification* task, std::vector<cModule*>& d
     // Calculate MBS travel time
     auto mbsMob = check_and_cast<inet::IMobility *>(mbs->getParentModule()->getSubmodule("mobility"));
     double mbsDist = mbsMob->getCurrentPosition().distance(inet::Coord(centroidX, centroidY, 0));
-    double mbsTravelTime = mbsDist / mbs->getParentModule()->par("speed").doubleValue();
+
+    // תיקון: קריאת המהירות ישירות ממודול האפליקציה (mbs) ולא מהאבא
+    double mbsTravelTime = mbsDist / mbs->par("speed").doubleValue();
     if (mbsTravelTime > maxTravelTime) maxTravelTime = mbsTravelTime;
 
     // Calculate Drones travel time
     for (cModule* dMod : drones) {
         auto dMob = check_and_cast<inet::IMobility *>(dMod->getParentModule()->getSubmodule("mobility"));
         double dDist = dMob->getCurrentPosition().distance(inet::Coord(targetX, targetY, 0));
-        double dTravelTime = dDist / dMod->getParentModule()->par("speed").doubleValue();
+
+        // תיקון: קריאת המהירות ישירות ממודול האפליקציה (dMod) ולא מהאבא
+        double dTravelTime = dDist / dMod->par("speed").doubleValue();
         if (dTravelTime > maxTravelTime) maxTravelTime = dTravelTime;
     }
 
