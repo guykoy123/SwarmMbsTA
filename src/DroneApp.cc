@@ -2,7 +2,7 @@
  * DroneApp.cc
  *
  *  Created on: Mar 6, 2026
- *      Author: Guy Koyfman
+ *      Author: Guy Koyfman & Omer
  */
 
 #include "DroneApp.h"
@@ -11,9 +11,8 @@
 Define_Module(uavswarmta::DroneApp);
 namespace uavswarmta {
 
-
-
 void DroneApp::initialize(int stage) {
+    // --- שלב 0: אתחול משתנים מקומיים וחישובים לפני שהרשת מתעוררת ---
     if (stage == inet::INITSTAGE_LOCAL) {
         droneId = getParentModule()->getIndex();
         currentState = IDLE;
@@ -43,19 +42,19 @@ void DroneApp::initialize(int stage) {
         commRange = par("drone_comm_range").doubleValue(); // Supports the 250m in your .ini
         commTimeoutDuration = par("commTimeoutDuration");
 
-
         energyThreshold = par("energyThreshold").doubleValue();
         rechargeDuration = par("rechargeDuration").doubleValue();
         rechargeTimer = new cMessage("rechargeTimer");
-
 
         arrivalTimer = new cMessage("arrivalTimer");
         taskCompletionTimer = new cMessage("taskCompletionTimer");
         connectionCheckTimer = new cMessage("connectionCheckTimer");
         connectionTimeoutTimer = new cMessage("connectionTimeoutTimer");
-
+    }
+    // --- שלב 3: הרשת באוויר, אפשר לפתוח פורטים (UDP) ---
+    else if (stage == inet::INITSTAGE_APPLICATION_LAYER) {
         socket.setOutputGate(gate("socketOut"));
-//        socket.setProtocol(&inet::Protocol::udp);
+        // socket.setProtocol(&inet::Protocol::udp); // השורה הזו נשארת בהערה או נמחקת
         socket.bind(par("localPort"));
         socket.setCallback(this);
     }
@@ -172,12 +171,12 @@ void DroneApp::initiateRecharge() {
 
     inet::Coord targetStation = findClosestRechargeStation();
 
-
     double travelTime = mobility->getCurrentPosition().distance(targetStation) / par("speed").doubleValue();
 
     cancelEvent(arrivalTimer); // Cancel current travel if we were mid-flight
     scheduleAt(simTime() + travelTime, arrivalTimer);
 }
+
 // -----------------------------------------------------------------------
 // GOD MODE ASSIGNMENT (Called directly by Main Node C++ code)
 // -----------------------------------------------------------------------
@@ -192,10 +191,10 @@ void DroneApp::assignTask(int taskId, double syncedTravelTime, double duration, 
     EV << "Drone " << droneId << " assigned Task #" << taskId
        << ". Synced arrival in: " << syncedTravelTime << "s.\n";
 
-
     // 2. Schedule the perfectly synced start time
     scheduleAt(simTime() + syncedTravelTime, arrivalTimer);
 }
+
 // =======================================================================
 // MAIN MESSAGE ROUTER
 // =======================================================================
@@ -291,7 +290,6 @@ void DroneApp::handleConnectionTimeout() {
     cancelEvent(connectionCheckTimer);
     currentState = RETURNING_HOME;
 
-
     double travelTime = mobility->getCurrentPosition().distance(homePosition) / par("speed").doubleValue();
     scheduleAt(simTime() + travelTime, arrivalTimer);
 }
@@ -309,14 +307,14 @@ void DroneApp::handleTaskCompletion() {
     auto chunk = inet::makeShared<TaskCompletion>();
     chunk->setTaskId(currentTaskId);
     chunk->setDroneId(droneId);
+    chunk->setChunkLength(inet::B(16)); // התיקון הקריטי כאן
     packet->insertAtBack(chunk);
 
     // Add tags so the MessageDispatcher knows this is UDP
     packet->addTagIfAbsent<inet::PacketProtocolTag>()->setProtocol(&inet::Protocol::udp);
-//    packet->addTagIfAbsent<inet::DispatchProtocolTag>()->setProtocol(&inet::Protocol::udp);
 
     inet::L3Address destAddr("10.0.0.1"); // Main Node IP
-    socket.sendTo(packet, destAddr, par("destPort"));
+    socket.sendTo(packet, destAddr, par("destPort").intValue());
 
     currentTaskId = -1;
     mbsMobility = nullptr;
@@ -342,10 +340,11 @@ void DroneApp::sendTaskDropNotification() {
     chunk->setTaskId(currentTaskId);
     chunk->setDroppingDroneId(droneId);
     chunk->setRemainingDuration(savedRemainingDuration);
+    chunk->setChunkLength(inet::B(16)); // התיקון הקריטי כאן
     packet->insertAtBack(chunk);
 
     inet::L3Address destAddr("10.0.0.1"); // Main Node IP
-    socket.sendTo(packet, destAddr, par("destPort"));
+    socket.sendTo(packet, destAddr, par("destPort").intValue());
 
     currentTaskId = -1;
     mbsMobility = nullptr;
@@ -354,9 +353,11 @@ void DroneApp::sendTaskDropNotification() {
 void DroneApp::socketDataArrived(inet::UdpSocket *socket, inet::Packet *packet) {
     delete packet; // We'll add real logic to this later if the drone needs to receive packets
 }
+
 void DroneApp::socketErrorArrived(inet::UdpSocket *socket, inet::Indication *indication) {
     delete indication;
 }
+
 void DroneApp::socketClosed(inet::UdpSocket *socket) {}
 
 void DroneApp::dropTaskAndWait() {
@@ -369,10 +370,9 @@ void DroneApp::dropTaskAndWait() {
 
         chunk->setTaskId(currentTaskId);
         chunk->setDroppingDroneId(droneId);
-
-        // If you have a timer tracking remaining duration, you could calculate it here.
         // For now, we'll send a dummy value of 0.0 or the total duration.
         chunk->setRemainingDuration(0.0);
+        chunk->setChunkLength(inet::B(16)); // התיקון הקריטי גם כאן
 
         packet->insertAtBack(chunk);
 
@@ -386,7 +386,6 @@ void DroneApp::dropTaskAndWait() {
 
     // 4. Update state and cancel timers
     currentState = IDLE;
-    // If you have a taskTimer pointer, cancel it here:
-    // if (taskTimer && taskTimer->isScheduled()) { cancelEvent(taskTimer); }
 }
+
 } // namespace
