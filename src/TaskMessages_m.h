@@ -1,5 +1,5 @@
 //
-// Generated file, do not edit! Created by opp_msgtool 6.3 from TaskMessages.msg.
+// Generated file, do not edit! Created by opp_msgtool 6.3 from src/TaskMessages.msg.
 //
 
 #ifndef __UAVSWARMTA_TASKMESSAGES_M_H
@@ -35,7 +35,7 @@ class TaskDropNotification;
 namespace uavswarmta {
 
 /**
- * Class generated from <tt>TaskMessages.msg:14</tt> by opp_msgtool.
+ * Class generated from <tt>src/TaskMessages.msg:14</tt> by opp_msgtool.
  * <pre>
  * // 1. MAIN NODE -> DRONES: Notifies the swarm that a new task exists
  * class TaskNotification extends inet::FieldsChunk
@@ -97,7 +97,7 @@ inline void doParsimPacking(omnetpp::cCommBuffer *b, const TaskNotification& obj
 inline void doParsimUnpacking(omnetpp::cCommBuffer *b, TaskNotification& obj) {obj.parsimUnpack(b);}
 
 /**
- * Class generated from <tt>TaskMessages.msg:24</tt> by opp_msgtool.
+ * Class generated from <tt>src/TaskMessages.msg:24</tt> by opp_msgtool.
  * <pre>
  * // 2. DRONES -> MAIN NODE: A drone's auction bid for a specific task
  * class TaskBid extends inet::FieldsChunk
@@ -144,7 +144,7 @@ inline void doParsimPacking(omnetpp::cCommBuffer *b, const TaskBid& obj) {obj.pa
 inline void doParsimUnpacking(omnetpp::cCommBuffer *b, TaskBid& obj) {obj.parsimUnpack(b);}
 
 /**
- * Class generated from <tt>TaskMessages.msg:31</tt> by opp_msgtool.
+ * Class generated from <tt>src/TaskMessages.msg:31</tt> by opp_msgtool.
  * <pre>
  * // 3. MAIN NODE -> DRONES: The final assignment of who won the auction
  * class TaskAssignment extends inet::FieldsChunk
@@ -193,7 +193,7 @@ inline void doParsimPacking(omnetpp::cCommBuffer *b, const TaskAssignment& obj) 
 inline void doParsimUnpacking(omnetpp::cCommBuffer *b, TaskAssignment& obj) {obj.parsimUnpack(b);}
 
 /**
- * Class generated from <tt>TaskMessages.msg:37</tt> by opp_msgtool.
+ * Class generated from <tt>src/TaskMessages.msg:37</tt> by opp_msgtool.
  * <pre>
  * // DRONE -> MAIN NODE: Task is fully finished
  * class TaskCompletion extends inet::FieldsChunk
@@ -235,7 +235,7 @@ inline void doParsimPacking(omnetpp::cCommBuffer *b, const TaskCompletion& obj) 
 inline void doParsimUnpacking(omnetpp::cCommBuffer *b, TaskCompletion& obj) {obj.parsimUnpack(b);}
 
 /**
- * Class generated from <tt>TaskMessages.msg:43</tt> by opp_msgtool.
+ * Class generated from <tt>src/TaskMessages.msg:43</tt> by opp_msgtool.
  * <pre>
  * // DRONE -> MAIN NODE & PEER DRONES: Task is dropped before completion
  * class TaskDropNotification extends inet::FieldsChunk
@@ -296,4 +296,3 @@ template<> inline uavswarmta::TaskDropNotification *fromAnyPtr(any_ptr ptr) { re
 }  // namespace omnetpp
 
 #endif // ifndef __UAVSWARMTA_TASKMESSAGES_M_H
-
