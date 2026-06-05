@@ -93,9 +93,6 @@ void MainNodeApp::generateNewTask() {
     newTask->setRequiredDrones(intuniform(1, 3));
     newTask->setDuration(uniform(10, 60));
 
-    // Ensure the task packet has protocol tags for the dispatcher
-    newTask->addTagIfAbsent<inet::PacketProtocolTag>()->setProtocol(&inet::Protocol::udp);
-
     EV << "Generated Task #" << taskCounter << "\n";
     taskQueue.insert(newTask);
     tryAssignTask();

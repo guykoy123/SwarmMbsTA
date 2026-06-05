@@ -5,6 +5,7 @@ import inet.applications.contract.IApp;
 simple MbsApp like IApp
 {
     parameters:
+        int localPort = default(5000); // Port for UDP traffic
         double speed @unit(mps) = default(15mps); // MBSs are typically slower than the drones
 
         // Antenna tower tinted blue
