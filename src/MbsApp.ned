@@ -1,16 +1,16 @@
 package uavswarmta;
-@namespace(uavswarmta); // This tells NED to look inside your C++ namespace
-import inet.applications.contract.IApp;
 
-simple MbsApp like IApp
+@namespace(uavswarmta);
+
+//
+// Mobile Base Station app. Coordinates with the main node entirely through
+// direct C++ calls; no network gates.
+//
+simple MbsApp like IMobileApp
 {
     parameters:
-        int localPort = default(5000); // Port for UDP traffic
-        double speed @unit(mps) = default(15mps); // MBSs are typically slower than the drones
+        double speed @unit(mps) = default(15mps);
+        double mbs_comm_range @unit(m) = default(800m);
 
-        // Antenna tower tinted blue
-        @display("i=custom/van-an-antenna,blue");
-    gates:
-        input socketIn;
-        output socketOut;
+        @display("i=device/antennatower,blue");
 }
