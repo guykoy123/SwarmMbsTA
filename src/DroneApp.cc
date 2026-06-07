@@ -168,6 +168,18 @@ void DroneApp::updateEnergy() {
 
 void DroneApp::die() {
     EV << "Drone " << droneId << " HAS RUN OUT OF ENERGY! Shutting down completely.\n";
+
+    // If we were mid-task, tell the main node the task got dropped so the
+    // activeTaskDroneCount can decrement and the task can be finalized.
+    if (currentTaskId != -1) {
+        if (taskCompletionTimer->isScheduled()) {
+            savedRemainingDuration = (taskCompletionTimer->getArrivalTime() - simTime()).dbl();
+        } else {
+            savedRemainingDuration = taskDuration;
+        }
+        sendTaskDropNotification();
+    }
+
     currentState = DEAD;
 
     cancelEvent(arrivalTimer);
@@ -274,6 +286,11 @@ void DroneApp::handleArrival() {
 }
 
 void DroneApp::handleConnectionCheck() {
+    // Periodically settle energy so we notice a low battery DURING a long task
+    // (otherwise updateEnergy only runs at state transitions).
+    updateEnergy();
+    if (currentState == DEAD) return;
+
     if (currentState == PERFORMING_TASK) {
         if (!hasConnection()) {
             handleConnectionLoss();
@@ -294,24 +311,27 @@ void DroneApp::handleConnectionCheck() {
 }
 
 void DroneApp::handleConnectionTimeout() {
-    updateEnergy();
-    if (currentState == DEAD) return;
-
+    // Decide what to do before charging energy (so even a death below still
+    // notifies the main node about the dropped task).
     EV << "Drone " << droneId << " connection timeout! Returning home.\n";
     cancelEvent(connectionCheckTimer);
     currentState = RETURNING_HOME;
     flyTo(homePosition);
+
+    updateEnergy();
 }
 
 void DroneApp::handleTaskCompletion() {
-    updateEnergy();
-    if (currentState == DEAD) return;
-
-    currentState = IDLE;
-    cancelEvent(connectionCheckTimer);
-
+    // The work is done as of *this* event -- report it before anything else,
+    // so that even if updateEnergy() kills us or sends us off to recharge,
+    // the main node has already been told the task finished successfully.
     EV << "Drone " << droneId << " finished Task #" << currentTaskId << ".\n";
+    cancelEvent(connectionCheckTimer);
     sendTaskCompletion();
+    currentState = IDLE;
+
+    // Now it's safe to settle the energy account (may trigger recharge / die).
+    updateEnergy();
 }
 
 void DroneApp::handleRechargeCompletion() {
