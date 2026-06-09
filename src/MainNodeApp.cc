@@ -36,7 +36,10 @@ MainNodeApp::~MainNodeApp() {
 int MainNodeApp::compareTaskPriority(cObject *a, cObject *b) {
     TaskNotification *taskA = check_and_cast<TaskNotification*>(a);
     TaskNotification *taskB = check_and_cast<TaskNotification*>(b);
-    return taskB->getPriority() - taskA->getPriority();
+    // Priority convention: 1 = HIGH urgency, 3 = LOW. Return negative when A
+    // should come first, so subtract A from B's number... i.e. a-b gives us
+    // ascending priority numbers (high-urgency at the front of the queue).
+    return taskA->getPriority() - taskB->getPriority();
 }
 
 // -----------------------------------------------------------------------
@@ -49,9 +52,15 @@ void MainNodeApp::initialize(int stage) {
         commRange = 1e9;  // mainNode is "god mode"; no link is range-limited
 
         std::string algo = par("algorithmType").stringValue();
-        if (algo == "AUCTION") {
+        if (algo == "AUCTION" || algo == "COST") {
             taskQueue.setup(compareTaskPriority);
         }
+
+        // Cache cost-function tunables once; they're hot-path constants.
+        costEnergyWeight        = par("costEnergyWeight").doubleValue();
+        costHaltPriorityWeight  = par("costHaltPriorityWeight").doubleValue();
+        costHaltGroupSizeWeight = par("costHaltGroupSizeWeight").doubleValue();
+        costMbsRelocationWeight = par("costMbsRelocationWeight").doubleValue();
 
         generateTaskTimer = new cMessage("generateTaskTimer");
         scheduleAt(simTime() + par("taskGenerationInterval"), generateTaskTimer);
@@ -131,8 +140,14 @@ void MainNodeApp::tryAssignTask() {
     std::string algo = par("algorithmType").stringValue();
     if (algo == "FIFO") {
         assignTaskFifo();
+    } else if (algo == "COST") {
+        assignTaskCost();
     } else if (algo == "AUCTION") {
-        // assignTaskAuction();  // TODO
+        // Legacy alias kept for backward compatibility with old .ini files.
+        assignTaskCost();
+    } else {
+        throw cRuntimeError("Unknown algorithmType '%s' (expected 'FIFO' or 'COST')",
+                            algo.c_str());
     }
 }
 
@@ -155,41 +170,43 @@ void MainNodeApp::onTaskDropNotification(int taskId, int droneId, double remaini
 }
 
 void MainNodeApp::handleTaskUpdate(int taskId, int droneId, bool isCompletion, double remainingDuration) {
+    // Drone failure path (death, recharge, connection timeout):
+    //   * survivors stay on the task -- they just take longer to finish
+    //     (duration scales by oldCount/newCount, per "fewer drones = slower").
+    //   * if the failing drone was the LAST one, the task is marked DROPPED.
+    //
+    // Completion path:
+    //   * just decrement; when count reaches 0 the task is marked COMPLETED.
+    //     (Survivors don't need extension on a completion -- the completer
+    //      already finished its share of the work.)
+    auto rit = taskRecords.find(taskId);
+    if (rit != taskRecords.end() && !isCompletion) rit->second.dropEvents++;
+
+    auto cit = activeTaskDroneCount.find(taskId);
+    if (cit == activeTaskDroneCount.end()) return;
+
+    int oldCount = cit->second;
+    int newCount = oldCount - 1;
+    cit->second = newCount;
+
     if (!isCompletion) {
-        EV << "WARNING: Task #" << taskId << " was dropped by Drone " << droneId << "!\n";
-        activeTaskHadDrop[taskId] = true;
-        auto rit = taskRecords.find(taskId);
-        if (rit != taskRecords.end()) rit->second.dropEvents++;
-        // TODO: re-queue with remainingDuration if desired
+        EV << "WARNING: drone " << droneId << " bailed on Task #" << taskId
+           << " (now " << newCount << "/" << oldCount << " drones).\n";
     }
 
-    if (activeTaskDroneCount.find(taskId) != activeTaskDroneCount.end()) {
-        activeTaskDroneCount[taskId]--;
-
-        if (activeTaskDroneCount[taskId] <= 0) {
-            EV << "All assigned drones have reported back for Task #" << taskId
-               << ". Releasing MBS coverage.\n";
-
-            std::string outcome;
-            if (activeTaskHadDrop[taskId]) { tasksDropped++;  outcome = "DROPPED"; }
-            else                           { tasksCompleted++; outcome = "COMPLETED"; }
-
-            // Emit CSV row (and forget the record).
-            auto rit = taskRecords.find(taskId);
-            if (rit != taskRecords.end()) {
-                writeCsvRow(rit->second, outcome);
-                taskRecords.erase(rit);
-            }
-
-            activeTaskDroneCount.erase(taskId);
-            activeTaskLocations.erase(taskId);
-            activeTaskHadDrop.erase(taskId);
-            removeTaskFigure(taskId);
-            removeTaskFromMbs(taskId);
-            refreshStatsPanel();
-            tryAssignTask();
+    if (newCount > 0) {
+        if (!isCompletion) {
+            // The team shrank but the task continues; survivors do extra work.
+            double scale = (double)oldCount / (double)newCount;
+            scaleRemainingDurationForTask(taskId, droneId, scale);
         }
+        return;
     }
+
+    // newCount == 0 -- this was the last drone. Finalize the task.
+    EV << "Task #" << taskId << " has no drones left ("
+       << (isCompletion ? "completed" : "all bailed") << ").\n";
+    finalizeTask(taskId, isCompletion ? "COMPLETED" : "DROPPED");
 }
 
 void MainNodeApp::removeTaskFromMbs(int taskId) {
@@ -205,6 +222,110 @@ void MainNodeApp::removeTaskFromMbs(int taskId) {
             break;
         }
     }
+}
+
+// -----------------------------------------------------------------------
+// SHARED HELPERS for "some drones leave, others slow down"
+// -----------------------------------------------------------------------
+// Tell every drone still on `taskId` (except the one leaving) to extend its
+// remaining work by `scale`. Skipping the leaver is important because the
+// caller is in the middle of removing it, and its bookkeeping state hasn't
+// settled yet.
+void MainNodeApp::scaleRemainingDurationForTask(int taskId, int leavingDroneId, double scale) {
+    if (scale <= 1.0) return;
+    int totalDrones = getParentModule()->getParentModule()->par("numDrones").intValue();
+    int affected = 0;
+    for (int i = 0; i < totalDrones; i++) {
+        if (i == leavingDroneId) continue;
+        cModule *dm = getModuleByPath(("^.^.drone[" + std::to_string(i) + "].app[0]").c_str());
+        auto dApp = check_and_cast<uavswarmta::DroneApp *>(dm);
+        if (dApp->getCurrentTaskId() == taskId) {
+            dApp->extendRemainingDuration(scale);
+            affected++;
+        }
+    }
+    EV << "Task #" << taskId << " survivors (" << affected
+       << " drones) had remaining duration scaled by " << scale << "x.\n";
+}
+
+// Bookkeeping + CSV row for a task that has ended (one way or another).
+void MainNodeApp::finalizeTask(int taskId, const std::string& outcome) {
+    if (outcome == "DROPPED") tasksDropped++;
+    else                      tasksCompleted++;
+
+    auto rit = taskRecords.find(taskId);
+    if (rit != taskRecords.end()) {
+        writeCsvRow(rit->second, outcome);
+        taskRecords.erase(rit);
+    }
+
+    activeTaskDroneCount.erase(taskId);
+    activeTaskLocations.erase(taskId);
+    activeTaskHadDrop.erase(taskId);
+    removeTaskFigure(taskId);
+    removeTaskFromMbs(taskId);
+    refreshStatsPanel();
+    tryAssignTask();
+}
+
+// Bookkeeping for a single COST-allocator preemption. Unlike a real drop,
+// preemption never marks the old task as DROPPED:
+//   * if other drones remain on it, they pick up the slack (longer duration)
+//   * if this was the last drone, the old task is RE-QUEUED so it can be
+//     re-auctioned (the priority-sorted queue puts it back in the right slot)
+void MainNodeApp::handlePreemption(int oldTaskId, int leavingDroneId, int newTaskId) {
+    auto cit = activeTaskDroneCount.find(oldTaskId);
+    if (cit == activeTaskDroneCount.end()) return;
+
+    int oldCount = cit->second;
+    int newCount = oldCount - 1;
+    cit->second = newCount;
+
+    EV << "COST: preempting drone " << leavingDroneId << " from Task #"
+       << oldTaskId << " for new Task #" << newTaskId
+       << " (group " << oldCount << " -> " << newCount << ").\n";
+
+    if (newCount > 0) {
+        double scale = (double)oldCount / (double)newCount;
+        scaleRemainingDurationForTask(oldTaskId, leavingDroneId, scale);
+    } else {
+        EV << "Task #" << oldTaskId << " lost its last drone to preemption; "
+           << "re-queuing for another auction round.\n";
+        requeuePreemptedTask(oldTaskId);
+    }
+}
+
+// Build a fresh TaskNotification from the surviving TaskRecord and put it
+// back in the queue (which is priority-sorted in COST mode). Cleans up the
+// transient "active" state so the next dispatch starts from scratch, but
+// preserves the TaskRecord so all metadata (generatedAt, taskId, etc.) is
+// kept end-to-end -- one task = one CSV row, even with re-queuing.
+void MainNodeApp::requeuePreemptedTask(int taskId) {
+    auto rit = taskRecords.find(taskId);
+    if (rit == taskRecords.end()) return;
+    const TaskRecord& r = rit->second;
+
+    TaskNotification *tn = new TaskNotification();
+    tn->setTaskId(r.taskId);
+    tn->setTargetX(r.targetX);
+    tn->setTargetY(r.targetY);
+    tn->setPriority(r.priority);
+    tn->setRequiredDrones(r.requiredDrones);
+    tn->setDuration(r.duration);
+
+    // Reset dispatch-side bookkeeping so the next attempt records cleanly.
+    rit->second.dispatchedAt = -1;
+    rit->second.mbsId = -1;
+    rit->second.dronesAssigned = 0;
+
+    activeTaskDroneCount.erase(taskId);
+    activeTaskLocations.erase(taskId);
+    activeTaskHadDrop.erase(taskId);
+    removeTaskFromMbs(taskId);
+    markTaskQueued(taskId);   // figure turns red again so it's visible
+
+    taskQueue.insert(tn);
+    refreshStatsPanel();
 }
 
 // -----------------------------------------------------------------------
@@ -233,6 +354,301 @@ void MainNodeApp::assignTaskFifo() {
 
     taskQueue.pop();
     dispatchUnits(task, assignedDrones, assignedMbs, centroidX, centroidY);
+
+    delete task;
+    tryAssignTask();
+}
+
+// -----------------------------------------------------------------------
+// COST ASSIGNMENT (auction with preemption, per the project paper)
+// -----------------------------------------------------------------------
+// The COST allocator mirrors the algorithm in the preliminary report:
+//   step 1 - pick the lowest-cost set of UAVs (idle OR busy on a lower-prio
+//            task that we are willing to halt)
+//   step 2 - pick the lowest-cost MBS to cover the new task site
+// Cost weights are NED params so the math can be tuned at run time.
+//
+// PRIORITY CONVENTION: integer 1..3 where 1 = HIGH urgency, 3 = LOW urgency
+// (matches generateNewTask's intuniform(1,3)). Lower number = more important.
+// A busy drone is preemptible only when its currentPriority > newPriority.
+//
+// The two helpers below are the *only* place the cost math lives -- keep them
+// short. Multipliers come from NED params named cost*.
+// -----------------------------------------------------------------------
+
+double MainNodeApp::computeHaltPenalty(int currentPriority, int currentGroupSize) {
+    // halt(t) -- the punishment for abandoning the task currently being run.
+    // Higher-priority (lower-numbered) tasks are MORE painful to halt, so the
+    // priority term is (4 - p): priority 1 -> 3x weight, priority 3 -> 1x.
+    // The group-size term scales with how many drones we'd be disrupting.
+    return costHaltPriorityWeight * (4 - currentPriority)
+         + costHaltGroupSizeWeight * currentGroupSize;
+}
+
+double MainNodeApp::computeDroneCost(cModule* droneMod, double targetX, double targetY, int newTaskPriority) {
+    auto droneApp = check_and_cast<uavswarmta::DroneApp *>(droneMod);
+    auto dMob = check_and_cast<inet::IMobility *>(
+        droneMod->getParentModule()->getSubmodule("mobility"));
+
+    double dist = dMob->getCurrentPosition().distance(
+        inet::Coord(targetX, targetY, dMob->getCurrentPosition().z));
+
+    // c(u, t) = e(u, t) + halt(currentTask) -- per the paper.
+    double energyCost = costEnergyWeight * dist;
+    double haltCost   = 0.0;
+    int oldTaskId = -1, oldPriority = -1, groupSize = 0;
+
+    if (!droneApp->isIdle()) {
+        oldTaskId = droneApp->getCurrentTaskId();
+        oldPriority = 99;
+        auto rit = taskRecords.find(oldTaskId);
+        if (rit != taskRecords.end()) oldPriority = rit->second.priority;
+        auto cit = activeTaskDroneCount.find(oldTaskId);
+        if (cit != activeTaskDroneCount.end()) groupSize = cit->second;
+        haltCost = computeHaltPenalty(oldPriority, groupSize);
+    }
+
+    int droneIdx = droneMod->getParentModule()->getIndex();
+    EV << "  [COST/drone] D" << droneIdx
+       << (droneApp->isIdle() ? " (idle)"
+                              : (std::string(" (busy on T") + std::to_string(oldTaskId)
+                                 + " prio=" + std::to_string(oldPriority)
+                                 + " group=" + std::to_string(groupSize) + ")").c_str())
+       << " dist=" << dist
+       << " energyCost=" << energyCost
+       << " haltCost=" << haltCost
+       << " TOTAL=" << (energyCost + haltCost) << "\n";
+
+    return energyCost + haltCost;
+}
+
+std::vector<cModule*> MainNodeApp::findCostMinimalDrones(
+        double targetX, double targetY, int reqDrones, int newPriority) {
+    // Eligible pool A = { idle drones } U { busy drones with a STRICTLY
+    // lower-priority current task } (per step 1 of the algorithm). Dead
+    // drones and equally-or-more-important busy drones are excluded.
+    std::vector<std::pair<double, cModule*>> ranked;
+    int totalDrones = getParentModule()->getParentModule()->par("numDrones").intValue();
+
+    EV << " --- AUCTION drone scoring (need " << reqDrones
+       << ", newPrio=" << newPriority << ") ---\n";
+    int skippedDead = 0, skippedBusyHighPrio = 0;
+
+    for (int i = 0; i < totalDrones; i++) {
+        cModule *droneMod = getModuleByPath(("^.^.drone[" + std::to_string(i) + "].app[0]").c_str());
+        auto droneApp = check_and_cast<uavswarmta::DroneApp *>(droneMod);
+        if (!droneApp->isAlive()) { skippedDead++; continue; }
+
+        bool eligible = false;
+        if (droneApp->isIdle()) {
+            eligible = true;
+        } else {
+            int oldTaskId = droneApp->getCurrentTaskId();
+            auto rit = taskRecords.find(oldTaskId);
+            if (rit != taskRecords.end() && rit->second.priority > newPriority) {
+                eligible = true;   // current task is less urgent -> preemptible
+            }
+        }
+        if (!eligible) { skippedBusyHighPrio++; continue; }
+
+        double c = computeDroneCost(droneMod, targetX, targetY, newPriority);
+        ranked.push_back({c, droneMod});
+    }
+
+    EV << " --- (" << ranked.size() << " eligible, " << skippedDead
+       << " dead, " << skippedBusyHighPrio << " locked on equal/higher prio) ---\n";
+
+    std::sort(ranked.begin(), ranked.end(),
+              [](const std::pair<double, cModule*>& a, const std::pair<double, cModule*>& b) {
+                  return a.first < b.first;
+              });
+
+    std::vector<cModule*> picked;
+    for (int i = 0; i < reqDrones && i < (int)ranked.size(); i++) {
+        picked.push_back(ranked[i].second);
+        int idx = ranked[i].second->getParentModule()->getIndex();
+        EV << " >> AUCTION picked drone D" << idx
+           << " with cost " << ranked[i].first << "\n";
+    }
+    return picked;
+}
+
+cModule* MainNodeApp::findCostMinimalMbs(
+        double targetX, double targetY, int newPriority,
+        double& outCentroidX, double& outCentroidY) {
+    // Step 2: pick the MBS that minimises c(m) = halt-of-its-tasks + relocation.
+    // Three buckets of MBSs are evaluated uniformly:
+    //   (a) idle MBS                       -> c = relocation distance
+    //   (b) active MBS that can EXTEND to cover the new task (no drop)
+    //                                      -> c = relocation distance
+    //   (c) active MBS whose current tasks all have priority > newPriority,
+    //       i.e. we are willing to drop them -> c = relocation + halt sum
+    // Active MBSs holding a higher-or-equal-priority task are skipped.
+    inet::Coord newTaskPos(targetX, targetY, 0);
+    int totalMbs = getParentModule()->getParentModule()->par("numMbs").intValue();
+
+    cModule* bestMbs = nullptr;
+    double bestCost = std::numeric_limits<double>::infinity();
+    double bestCx = targetX, bestCy = targetY;
+    int bestIdx = -1;
+
+    EV << " --- AUCTION MBS scoring (newPrio=" << newPriority << ") ---\n";
+
+    for (int i = 0; i < totalMbs; i++) {
+        cModule *mbsMod = getModuleByPath(("^.^.mbs[" + std::to_string(i) + "].app[0]").c_str());
+        auto mbsApp = check_and_cast<uavswarmta::MbsApp *>(mbsMod);
+        auto mob = check_and_cast<inet::IMobility *>(
+            mbsMod->getParentModule()->getSubmodule("mobility"));
+        inet::Coord mbsPos = mob->getCurrentPosition();
+
+        double proposedCx = targetX, proposedCy = targetY;
+        double haltSum = 0.0;
+        bool feasible = false;
+        const char* mode = "IDLE";
+
+        if (mbsApp->isIdle()) {
+            feasible = true;
+        } else {
+            // First try EXTEND: can the MBS shift to a centroid that still covers
+            // all of its tasks + the new task? (No drops, no halt cost.)
+            std::vector<int> currentTasks = mbsApp->getAssignedTasks();
+            double sumX = targetX, sumY = targetY;
+            int count = 1;
+            for (int tid : currentTasks) {
+                sumX += activeTaskLocations[tid].x;
+                sumY += activeTaskLocations[tid].y;
+                count++;
+            }
+            double cX = sumX / count, cY = sumY / count;
+            inet::Coord centroid(cX, cY, 0);
+            double mbsRange = mbsApp->getCommRange();
+            double effectiveRange = (droneCommRange > 0 && droneCommRange < mbsRange)
+                                        ? droneCommRange : mbsRange;
+            bool extendOk = (newTaskPos.distance(centroid) <= effectiveRange);
+            for (int tid : currentTasks) {
+                if (activeTaskLocations[tid].distance(centroid) > effectiveRange) {
+                    extendOk = false; break;
+                }
+            }
+
+            if (extendOk) {
+                proposedCx = cX; proposedCy = cY;
+                feasible = true;
+                mode = "EXTEND";
+            } else {
+                // Falling back to RELOCATE-AND-DROP: only valid if every current
+                // task is less urgent than the new one.
+                bool allLower = true;
+                for (int tid : currentTasks) {
+                    auto rit = taskRecords.find(tid);
+                    int p = (rit != taskRecords.end()) ? rit->second.priority : 99;
+                    if (p <= newPriority) { allLower = false; break; }
+                    int gs = activeTaskDroneCount.count(tid) ? activeTaskDroneCount.at(tid) : 0;
+                    haltSum += computeHaltPenalty(p, gs);
+                }
+                if (allLower) { feasible = true; mode = "DROP"; }
+                else          { mode = "LOCKED"; }
+            }
+        }
+
+        if (!feasible) {
+            EV << "  [COST/mbs] M" << i << " " << mode << " -> infeasible\n";
+            continue;
+        }
+
+        double relocDist = mbsPos.distance(inet::Coord(proposedCx, proposedCy, mbsPos.z));
+        double cost = costMbsRelocationWeight * relocDist + haltSum;
+
+        EV << "  [COST/mbs] M" << i << " " << mode
+           << " relocDist=" << relocDist
+           << " haltSum=" << haltSum
+           << " TOTAL=" << cost << "\n";
+
+        if (cost < bestCost) {
+            bestCost = cost;
+            bestMbs = mbsMod;
+            bestCx = proposedCx;
+            bestCy = proposedCy;
+            bestIdx = i;
+        }
+    }
+
+    if (bestMbs != nullptr) {
+        outCentroidX = bestCx;
+        outCentroidY = bestCy;
+        EV << " >> AUCTION picked MBS M" << bestIdx
+           << " centroid=(" << bestCx << "," << bestCy
+           << ") cost=" << bestCost << "\n";
+    } else {
+        EV << " >> AUCTION: NO feasible MBS!\n";
+    }
+    return bestMbs;
+}
+
+void MainNodeApp::preemptAndDispatchUnits(TaskNotification* task,
+        std::vector<cModule*>& drones, cModule* mbs,
+        double centroidX, double centroidY) {
+    // Before the normal dispatch sequence, any drone we picked that's currently
+    // busy must release its old task. We do the accounting HERE on the main
+    // node (decrement counters, mark drop, possibly finalise) and then call
+    // DroneApp::preempt() which just cleans local state.
+    //
+    // Order matters: bookkeep ALL preemptions first (so the cascading
+    // finalisations / new tryAssignTask() calls happen against a coherent
+    // world), THEN call preempt() on the drones, THEN dispatch the new task.
+
+    struct Preemption { cModule* drone; int oldTaskId; int droneId; };
+    std::vector<Preemption> preemptions;
+    for (cModule* dMod : drones) {
+        auto dApp = check_and_cast<uavswarmta::DroneApp *>(dMod);
+        if (!dApp->isIdle()) {
+            preemptions.push_back({dMod, dApp->getCurrentTaskId(),
+                                   dMod->getParentModule()->getIndex()});
+        }
+    }
+
+    for (auto& p : preemptions) {
+        // handlePreemption decrements activeTaskDroneCount and either
+        //   (a) extends the survivors' duration if peers remain, or
+        //   (b) re-queues the old task if this was the last drone on it.
+        // Either way, the old task is NOT dropped.
+        handlePreemption(p.oldTaskId, p.droneId, task->getTaskId());
+    }
+    for (auto& p : preemptions) {
+        auto dApp = check_and_cast<uavswarmta::DroneApp *>(p.drone);
+        dApp->preempt();
+    }
+
+    dispatchUnits(task, drones, mbs, centroidX, centroidY);
+}
+
+void MainNodeApp::assignTaskCost() {
+    TaskNotification *task = check_and_cast<TaskNotification *>(taskQueue.front());
+    double targetX = task->getTargetX();
+    double targetY = task->getTargetY();
+    int reqDrones = task->getRequiredDrones();
+    int priority  = task->getPriority();
+    EV << "\n===== AUCTION ROUND for Task #" << task->getTaskId()
+       << " prio=" << priority << " needs=" << reqDrones
+       << " at (" << targetX << "," << targetY
+       << ") | queueDepth=" << taskQueue.getLength() << " =====\n";
+
+    std::vector<cModule*> assignedDrones =
+        findCostMinimalDrones(targetX, targetY, reqDrones, priority);
+    if ((int)assignedDrones.size() < reqDrones) {
+        EV << "COST: not enough eligible drones for task " << task->getTaskId() << "\n";
+        return;
+    }
+
+    double centroidX = 0, centroidY = 0;
+    cModule* assignedMbs = findCostMinimalMbs(targetX, targetY, priority, centroidX, centroidY);
+    if (assignedMbs == nullptr) {
+        EV << "COST: no MBS available for task " << task->getTaskId() << "\n";
+        return;
+    }
+
+    taskQueue.pop();
+    preemptAndDispatchUnits(task, assignedDrones, assignedMbs, centroidX, centroidY);
 
     delete task;
     tryAssignTask();
@@ -440,6 +856,18 @@ void MainNodeApp::markTaskActive(int taskId) {
     if (auto halo = dynamic_cast<cOvalFigure *>(group->getFigure(0))) {
         halo->setLineColor(cFigure::Color("green"));
         halo->setFillColor(cFigure::Color("green"));
+    }
+}
+
+void MainNodeApp::markTaskQueued(int taskId) {
+    // Inverse of markTaskActive: flip the halo back to red so a re-queued
+    // task is visually distinguishable from one that's still being worked on.
+    auto it = taskFigures.find(taskId);
+    if (it == taskFigures.end()) return;
+    auto group = check_and_cast<cGroupFigure *>(it->second);
+    if (auto halo = dynamic_cast<cOvalFigure *>(group->getFigure(0))) {
+        halo->setLineColor(cFigure::Color("red"));
+        halo->setFillColor(cFigure::Color("yellow"));
     }
 }
 

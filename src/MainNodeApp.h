@@ -57,6 +57,12 @@ class MainNodeApp : public cSimpleModule {
     int maxQueueSize;
     double droneCommRange = 0;     // cached from drone[0].app[0].drone_comm_range
 
+    // Cached COST tunables (NED params, see MainNodeApp.ned).
+    double costEnergyWeight = 1.0;
+    double costHaltPriorityWeight = 100.0;
+    double costHaltGroupSizeWeight = 10.0;
+    double costMbsRelocationWeight = 1.0;
+
     // ---- stats for the HUD ----
     int tasksCompleted = 0;
     int tasksDropped = 0;
@@ -72,16 +78,43 @@ class MainNodeApp : public cSimpleModule {
     virtual void generateNewTask();
     virtual void tryAssignTask();
     virtual void assignTaskFifo();
+    virtual void assignTaskCost();
     virtual std::vector<cModule*> findClosestIdleDrones(double targetX, double targetY, int reqDrones);
     virtual cModule* findSuitableMbs(double targetX, double targetY, double& outCentroidX, double& outCentroidY);
     virtual void dispatchUnits(TaskNotification* task, std::vector<cModule*>& drones, cModule* mbs, double centroidX, double centroidY);
 
+    // ---- COST-algorithm helpers (drone auction + MBS selection) -----------
+    // Keep computeDroneCost / computeMbsCost short and readable -- this is the
+    // single place to play with the cost-function math. Inputs are pre-resolved
+    // so the math itself is the only thing on screen.
+    virtual double computeDroneCost(cModule* droneMod, double targetX, double targetY, int newTaskPriority);
+    virtual double computeHaltPenalty(int currentPriority, int currentGroupSize);
+    virtual std::vector<cModule*> findCostMinimalDrones(double targetX, double targetY, int reqDrones, int newPriority);
+    virtual cModule* findCostMinimalMbs(double targetX, double targetY, int newPriority, double& outCentroidX, double& outCentroidY);
+    virtual void preemptAndDispatchUnits(TaskNotification* task, std::vector<cModule*>& drones, cModule* mbs, double centroidX, double centroidY);
+
     virtual void handleTaskUpdate(int taskId, int droneId, bool isCompletion, double remainingDuration = 0.0);
     virtual void removeTaskFromMbs(int taskId);
+
+    // ---- "Some drones leave, others pick up the slack" helpers ------------
+    // Called whenever a drone exits a shared task. The survivors stay on the
+    // task; their remaining work is multiplied by oldN/newN so the team still
+    // finishes, just more slowly. If newN reaches 0 the caller decides
+    // whether to finalize the task (failure path) or re-queue it (preemption).
+    virtual void scaleRemainingDurationForTask(int taskId, int leavingDroneId, double scale);
+    virtual void finalizeTask(int taskId, const std::string& outcome);
+
+    // Preemption-specific: bookkeeping helper used by the COST allocator.
+    // If other drones remain on the old task they pick up the slack; if the
+    // preempted drone was the LAST one, the task goes back to the priority
+    // queue (priority-respecting insert) instead of being marked DROPPED.
+    virtual void handlePreemption(int oldTaskId, int leavingDroneId, int newTaskId);
+    virtual void requeuePreemptedTask(int taskId);
 
     // Canvas markers so the user can see where each pending/active task is.
     virtual void addTaskFigure(int taskId, double x, double y);
     virtual void markTaskActive(int taskId);     // turn marker from queued -> active
+    virtual void markTaskQueued(int taskId);     // turn marker from active  -> queued (re-queue)
     virtual void removeTaskFigure(int taskId);
 
     // HUD with live counters (top-left of the canvas).

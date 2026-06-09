@@ -98,6 +98,61 @@ void DroneApp::assignTask(int taskId, double syncedTravelTime, double duration,
     scheduleAt(simTime() + syncedTravelTime, arrivalTimer);
 }
 
+// Forcibly clear our current task without notifying the main node (the
+// MainNodeApp's COST allocator already accounts for the drop on its side).
+// After this returns the drone is in IDLE state and safe to assignTask() again.
+void DroneApp::preempt() {
+    Enter_Method("preempt");
+    if (currentState == DEAD) return;
+
+    // Settle whatever energy was burned up to this instant so the new task
+    // starts with an accurate battery reading.
+    updateEnergy();
+    if (currentState == DEAD) return;
+
+    EV << "Drone " << droneId << " PREEMPTED from Task #" << currentTaskId
+       << " for a higher-priority assignment.\n";
+
+    cancelEvent(arrivalTimer);
+    cancelEvent(taskCompletionTimer);
+    cancelEvent(connectionCheckTimer);
+    cancelEvent(connectionTimeoutTimer);
+
+    currentTaskId = -1;
+    mbsMobility = nullptr;
+    savedRemainingDuration = 0.0;
+    currentState = IDLE;
+}
+
+// A peer just left the same task; pick up the slack by extending the time we
+// still need to work. Called by MainNodeApp::scaleRemainingDurationForTask.
+void DroneApp::extendRemainingDuration(double scaleFactor) {
+    Enter_Method("extendRemainingDuration");
+    if (currentState == DEAD || currentTaskId == -1 || scaleFactor <= 1.0) return;
+
+    if (currentState == PERFORMING_TASK && taskCompletionTimer->isScheduled()) {
+        double remaining = (taskCompletionTimer->getArrivalTime() - simTime()).dbl();
+        double extended  = remaining * scaleFactor;
+        cancelEvent(taskCompletionTimer);
+        scheduleAt(simTime() + extended, taskCompletionTimer);
+        EV << "Drone " << droneId << " picking up slack on Task #" << currentTaskId
+           << ": remaining " << remaining << "s -> " << extended << "s (x"
+           << scaleFactor << ").\n";
+    } else if (currentState == WAITING_FOR_CONNECTION) {
+        savedRemainingDuration *= scaleFactor;
+        EV << "Drone " << droneId << " (waiting on Task #" << currentTaskId
+           << ") will resume with " << savedRemainingDuration << "s remaining.\n";
+    } else if (currentState == TRAVELLING) {
+        // Haven't started work yet -- scale the nominal duration so when we
+        // arrive and schedule the completion timer it reflects the new load.
+        taskDuration *= scaleFactor;
+        EV << "Drone " << droneId << " (en route to Task #" << currentTaskId
+           << ") will now work for " << taskDuration << "s after arrival.\n";
+    }
+    // Other states (RETURNING_HOME, recharge, etc.) -- we've already left the
+    // task semantically; nothing to extend.
+}
+
 // =======================================================================
 // MAIN MESSAGE ROUTER
 // =======================================================================

@@ -28,8 +28,24 @@ enum DroneState {
 class DroneApp : public cSimpleModule {
   public:
     bool isIdle() const { return currentState == IDLE; }
+    int  getCurrentTaskId() const { return currentTaskId; }
+    bool isAlive() const { return currentState != DEAD; }
     void assignTask(int taskId, double syncedTravelTime, double duration,
                     double targetX, double targetY, int assignedMbsId);
+
+    // Used by the COST allocator to forcibly free a busy drone for a higher
+    // priority task. The caller is responsible for bookkeeping the old task
+    // (e.g. decrementing activeTaskDroneCount); preempt() only cleans local
+    // state so that a subsequent assignTask() lands in a fresh drone.
+    void preempt();
+
+    // Called by the main node when peers leave a shared task -- the survivors
+    // shoulder more work, so their remaining duration is multiplied by
+    // scaleFactor (typically oldCount/newCount > 1.0). Safe to call from any
+    // state: TRAVELLING scales taskDuration, PERFORMING_TASK reschedules the
+    // completion timer, WAITING_FOR_CONNECTION scales savedRemainingDuration.
+    void extendRemainingDuration(double scaleFactor);
+
     virtual ~DroneApp();
 
   protected:
