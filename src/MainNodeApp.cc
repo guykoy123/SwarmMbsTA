@@ -268,11 +268,12 @@ void MainNodeApp::finalizeTask(int taskId, const std::string& outcome) {
     tryAssignTask();
 }
 
-// Bookkeeping for a single COST-allocator preemption. Unlike a real drop,
-// preemption never marks the old task as DROPPED:
-//   * if other drones remain on it, they pick up the slack (longer duration)
-//   * if this was the last drone, the old task is RE-QUEUED so it can be
-//     re-auctioned (the priority-sorted queue puts it back in the right slot)
+// Bookkeeping for a single COST-allocator preemption.
+//   * if other drones remain on the old task, they pick up the slack
+//     (longer duration, no penalty to stats)
+//   * if this was the LAST drone, the old task is marked DROPPED -- the
+//     allocator chose to sacrifice it for a higher-priority task, and that
+//     decision shows up in the stats so it can be measured/tuned.
 void MainNodeApp::handlePreemption(int oldTaskId, int leavingDroneId, int newTaskId) {
     auto cit = activeTaskDroneCount.find(oldTaskId);
     if (cit == activeTaskDroneCount.end()) return;
@@ -290,42 +291,9 @@ void MainNodeApp::handlePreemption(int oldTaskId, int leavingDroneId, int newTas
         scaleRemainingDurationForTask(oldTaskId, leavingDroneId, scale);
     } else {
         EV << "Task #" << oldTaskId << " lost its last drone to preemption; "
-           << "re-queuing for another auction round.\n";
-        requeuePreemptedTask(oldTaskId);
+           << "marking as DROPPED.\n";
+        finalizeTask(oldTaskId, "DROPPED");
     }
-}
-
-// Build a fresh TaskNotification from the surviving TaskRecord and put it
-// back in the queue (which is priority-sorted in COST mode). Cleans up the
-// transient "active" state so the next dispatch starts from scratch, but
-// preserves the TaskRecord so all metadata (generatedAt, taskId, etc.) is
-// kept end-to-end -- one task = one CSV row, even with re-queuing.
-void MainNodeApp::requeuePreemptedTask(int taskId) {
-    auto rit = taskRecords.find(taskId);
-    if (rit == taskRecords.end()) return;
-    const TaskRecord& r = rit->second;
-
-    TaskNotification *tn = new TaskNotification();
-    tn->setTaskId(r.taskId);
-    tn->setTargetX(r.targetX);
-    tn->setTargetY(r.targetY);
-    tn->setPriority(r.priority);
-    tn->setRequiredDrones(r.requiredDrones);
-    tn->setDuration(r.duration);
-
-    // Reset dispatch-side bookkeeping so the next attempt records cleanly.
-    rit->second.dispatchedAt = -1;
-    rit->second.mbsId = -1;
-    rit->second.dronesAssigned = 0;
-
-    activeTaskDroneCount.erase(taskId);
-    activeTaskLocations.erase(taskId);
-    activeTaskHadDrop.erase(taskId);
-    removeTaskFromMbs(taskId);
-    markTaskQueued(taskId);   // figure turns red again so it's visible
-
-    taskQueue.insert(tn);
-    refreshStatsPanel();
 }
 
 // -----------------------------------------------------------------------
@@ -856,18 +824,6 @@ void MainNodeApp::markTaskActive(int taskId) {
     if (auto halo = dynamic_cast<cOvalFigure *>(group->getFigure(0))) {
         halo->setLineColor(cFigure::Color("green"));
         halo->setFillColor(cFigure::Color("green"));
-    }
-}
-
-void MainNodeApp::markTaskQueued(int taskId) {
-    // Inverse of markTaskActive: flip the halo back to red so a re-queued
-    // task is visually distinguishable from one that's still being worked on.
-    auto it = taskFigures.find(taskId);
-    if (it == taskFigures.end()) return;
-    auto group = check_and_cast<cGroupFigure *>(it->second);
-    if (auto halo = dynamic_cast<cOvalFigure *>(group->getFigure(0))) {
-        halo->setLineColor(cFigure::Color("red"));
-        halo->setFillColor(cFigure::Color("yellow"));
     }
 }
 

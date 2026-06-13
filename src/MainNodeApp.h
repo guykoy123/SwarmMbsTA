@@ -106,15 +106,13 @@ class MainNodeApp : public cSimpleModule {
 
     // Preemption-specific: bookkeeping helper used by the COST allocator.
     // If other drones remain on the old task they pick up the slack; if the
-    // preempted drone was the LAST one, the task goes back to the priority
-    // queue (priority-respecting insert) instead of being marked DROPPED.
+    // preempted drone was the LAST one, the task is marked DROPPED (the
+    // allocator's choice to sacrifice it shows up in the stats).
     virtual void handlePreemption(int oldTaskId, int leavingDroneId, int newTaskId);
-    virtual void requeuePreemptedTask(int taskId);
 
     // Canvas markers so the user can see where each pending/active task is.
     virtual void addTaskFigure(int taskId, double x, double y);
     virtual void markTaskActive(int taskId);     // turn marker from queued -> active
-    virtual void markTaskQueued(int taskId);     // turn marker from active  -> queued (re-queue)
     virtual void removeTaskFigure(int taskId);
 
     // HUD with live counters (top-left of the canvas).
