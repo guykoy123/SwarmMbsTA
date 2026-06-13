@@ -10,6 +10,7 @@ simple MainNodeApp like IMobileApp
 {
     parameters:
         volatile double taskGenerationInterval @unit(s) = default(uniform(1s, 5s));
+        double taskDuration @unit(s) = default(30s);  // constant work-time per task (was uniform(10s,60s))
         int taskLimit = default(100);
         string algorithmType = default("FIFO");   // "FIFO" or "COST"
         bool bumpDroppedPriority = default(true);

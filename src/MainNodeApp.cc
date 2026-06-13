@@ -110,7 +110,7 @@ void MainNodeApp::generateNewTask() {
     newTask->setTargetY(uniform(0, 2000));
     newTask->setPriority(intuniform(1, 3));
     newTask->setRequiredDrones(intuniform(1, 3));
-    newTask->setDuration(uniform(10, 60));
+    newTask->setDuration(par("taskDuration").doubleValue());
 
     // Record metadata for later CSV row.
     TaskRecord rec;
