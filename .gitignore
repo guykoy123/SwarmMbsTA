@@ -8,3 +8,6 @@
 !*.msg
 !.gitignore
 !readme.md
+!*.py
+!*.ipynb
+!*.sh

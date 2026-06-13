@@ -1114,26 +1114,51 @@ void MainNodeApp::refreshStatsPanel() {
 // CSV per-task logging
 // -----------------------------------------------------------------------
 void MainNodeApp::openCsv() {
-    // One file per run: results/<config>-<run>-tasks.csv
+    // Path comes from the NED/ini param `csvOutputPath`. Supported
+    // placeholders (expanded once, here at sim start):
+    //   {configname}  -- active OMNeT++ config name (e.g. "General")
+    //   {runnumber}   -- active run number (0 for a single-run config)
+    //   {algorithm}   -- value of algorithmType param (e.g. "FIFO", "COST")
+    // Empty string disables logging entirely. Braces (no '$') intentionally,
+    // so the OMNeT++ ini parser doesn't try to treat these as iteration vars.
     cConfigurationEx *cfg = getEnvir()->getConfigEx();
     std::string configName = cfg->getActiveConfigName();
     int runNumber = cfg->getActiveRunNumber();
     std::string algo = par("algorithmType").stringValue();
 
-    std::ostringstream path;
-    path << "results/" << configName
-         << "-run" << runNumber
-         << "-" << algo
-         << "-tasks.csv";
-
-    // Make sure results/ exists (cheap, no-op if already there).
-    std::system("mkdir -p results");
-
-    csvOut.open(path.str());
-    if (!csvOut.is_open()) {
-        EV_WARN << "Could not open CSV file " << path.str() << "\n";
+    std::string path = par("csvOutputPath").stringValue();
+    if (path.empty()) {
+        EV << "csvOutputPath is empty -- per-task CSV logging is disabled.\n";
         return;
     }
+
+    auto replaceAll = [](std::string& s, const std::string& from,
+                         const std::string& to) {
+        if (from.empty()) return;
+        size_t pos = 0;
+        while ((pos = s.find(from, pos)) != std::string::npos) {
+            s.replace(pos, from.size(), to);
+            pos += to.size();
+        }
+    };
+    replaceAll(path, "{configname}", configName);
+    replaceAll(path, "{runnumber}",  std::to_string(runNumber));
+    replaceAll(path, "{algorithm}",  algo);
+
+    // Create any parent directories the user named (idempotent).
+    size_t slash = path.find_last_of('/');
+    if (slash != std::string::npos && slash > 0) {
+        std::string dir = path.substr(0, slash);
+        std::string cmd = "mkdir -p '" + dir + "'";
+        std::system(cmd.c_str());
+    }
+
+    csvOut.open(path);
+    if (!csvOut.is_open()) {
+        EV_WARN << "Could not open CSV file " << path << "\n";
+        return;
+    }
+    EV << "Per-task CSV log: " << path << "\n";
 
     csvOut << "run,algorithm,taskId,priority,requiredDrones,dronesAssigned,"
               "mbsId,targetX,targetY,duration,generatedAt,dispatchedAt,"

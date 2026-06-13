@@ -16,6 +16,14 @@ simple MainNodeApp like IMobileApp
         bool bumpDroppedPriority = default(true);
         bool ask_user = default(false);   // if true, popup-prompt for every tunable at sim start
 
+        // Per-task CSV output path. May contain the placeholders
+        //   {configname}  {runnumber}  {algorithm}
+        // which are expanded at sim start (NOTE: braces only, no '$' --
+        // OMNeT++'s ini parser would otherwise treat them as iteration
+        // variables). Set to empty string to disable CSV logging.
+        // Parent dirs are created if missing.
+        string csvOutputPath = default("results/{configname}-run{runnumber}-{algorithm}-tasks.csv");
+
         // --- COST-algorithm tunables (only used when algorithmType == "COST")
         // The cost function lives in MainNodeApp::computeDroneCost / computeMbsCost;
         // tweak these multipliers to play with how the auction values energy vs.
