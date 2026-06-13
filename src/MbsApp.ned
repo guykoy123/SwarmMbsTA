@@ -9,8 +9,8 @@ package uavswarmta;
 simple MbsApp like IMobileApp
 {
     parameters:
-        double speed @unit(mps) = default(15mps);
-        double mbs_comm_range @unit(m) = default(800m);
+        double speed @unit(mps) @mutable = default(15mps);
+        double mbs_comm_range @unit(m) @mutable = default(800m);
 
         @display("i=device/antennatower,blue");
 }

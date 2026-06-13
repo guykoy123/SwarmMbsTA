@@ -15,13 +15,13 @@ simple DroneApp like IMobileApp
         double travelPower @unit(W) = default(100W);
         double workingPower @unit(W) = default(50W);
 
-        double speed @unit(mps) = default(25mps);
+        double speed @unit(mps) @mutable = default(25mps);
 
         double energyThreshold @unit(J) = default(10000J);
         double rechargeDuration @unit(s) = default(5s);
 
-        double commTimeoutDuration @unit(s) = default(10s);
-        double drone_comm_range @unit(m) = default(250m);
+        double commTimeoutDuration @unit(s) @mutable = default(10s);
+        double drone_comm_range @unit(m) @mutable = default(250m);
 
         @display("i=misc/drone,cyan");
 }

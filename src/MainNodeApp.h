@@ -75,6 +75,11 @@ class MainNodeApp : public cSimpleModule {
     virtual void handleMessage(cMessage *msg) override;
     virtual void finish() override;
 
+    // If the NED param ask_user is true, pops a single GUI dialog at sim
+    // start listing every tunable parameter as "name=value; name=value; ...".
+    // The user edits inline; values are parsed back into the matching cPars.
+    virtual void promptUserForParameters();
+
     virtual void generateNewTask();
     virtual void tryAssignTask();
     virtual void assignTaskFifo();

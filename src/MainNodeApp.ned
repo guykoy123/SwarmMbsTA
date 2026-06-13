@@ -14,6 +14,7 @@ simple MainNodeApp like IMobileApp
         int taskLimit = default(100);
         string algorithmType = default("FIFO");   // "FIFO" or "COST"
         bool bumpDroppedPriority = default(true);
+        bool ask_user = default(false);   // if true, popup-prompt for every tunable at sim start
 
         // --- COST-algorithm tunables (only used when algorithmType == "COST")
         // The cost function lives in MainNodeApp::computeDroneCost / computeMbsCost;

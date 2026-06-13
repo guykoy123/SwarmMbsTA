@@ -9,6 +9,7 @@
 
 #include "DroneApp.h"
 #include "MbsApp.h"
+#include "ParamDialog.h"
 
 namespace uavswarmta {
 
@@ -43,6 +44,217 @@ int MainNodeApp::compareTaskPriority(cObject *a, cObject *b) {
 }
 
 // -----------------------------------------------------------------------
+// OPTIONAL prompt for every tunable param
+// -----------------------------------------------------------------------
+// When ask_user=true in the ini, we pop a dialog at sim start showing every
+// tunable in a form (one row per param). Under Qtenv we use a real Qt
+// QDialog (see ParamDialog.{h,cc}); under Cmdenv we fall back to a single
+// semicolon-separated text prompt via getEnvir()->gets() so the feature
+// still works headless. Cross-module params (drone_comm_range,
+// commTimeoutDuration, mbs_comm_range) are shown once and broadcast to
+// every drone[i] / mbs[i] submodule. Safe because mainNode is declared
+// before drone[]/mbs[] in SwarmNetwork.ned, so MainNodeApp's stage-0
+// initialize runs before any drone/mbs reads those params.
+void MainNodeApp::promptUserForParameters() {
+    int numDrones = getParentModule()->getParentModule()->par("numDrones").intValue();
+    int numMbs    = getParentModule()->getParentModule()->par("numMbs").intValue();
+
+    struct Row {
+        std::string label;
+        std::string hint;             // optional: unit / short description
+        cPar* primary;
+        std::vector<cPar*> broadcastTo;
+        std::vector<std::string> choices;   // empty -> free-text field
+        bool editable = false;              // applies only when choices set
+    };
+    std::vector<Row> rows;
+
+    auto unitHint = [](cPar& p) -> std::string {
+        const char* u = p.getUnit();
+        return u ? std::string("unit: ") + u : std::string();
+    };
+    auto addLocal = [&](const char* name) {
+        cPar& p = par(name);
+        rows.push_back({name, unitHint(p), &p, {}, {}, false});
+    };
+    auto addLocalChoice = [&](const char* name,
+                              std::vector<std::string> opts,
+                              bool editable) {
+        cPar& p = par(name);
+        rows.push_back({name, unitHint(p), &p, {}, std::move(opts), editable});
+    };
+    auto addBroadcast = [&](const char* label, const char* parentPattern,
+                            int count, const char* paramName) {
+        if (count <= 0) return;
+        Row r{label, "", nullptr, {}, {}, false};
+        for (int i = 0; i < count; i++) {
+            std::string path = std::string(parentPattern) + "[" + std::to_string(i) + "].app[0]";
+            cModule* m = getModuleByPath(path.c_str());
+            if (!m) continue;
+            if (!r.primary) {
+                r.primary = &m->par(paramName);
+                r.hint = unitHint(*r.primary);
+            } else {
+                r.broadcastTo.push_back(&m->par(paramName));
+            }
+        }
+        if (r.primary) rows.push_back(std::move(r));
+    };
+
+    // algorithmType: strict dropdown -- only two allocators are implemented.
+    addLocalChoice("algorithmType", {"FIFO", "COST"}, /*editable=*/false);
+    addLocal("taskLimit");
+    // taskGenerationInterval: editable dropdown with common arrival-pattern
+    // presets. UNIFORM = flat between bounds; NORMAL = Gaussian around a mean
+    // (a.k.a. "gaussian"); EXPONENTIAL = Poisson process, naturally produces
+    // bursts (short inter-arrival clusters); CONSTANT = back-to-back at a
+    // fixed cadence (the most extreme burst). Users can also type any
+    // custom OMNeT++ volatile expression here.
+    addLocalChoice("taskGenerationInterval", {
+        "uniform(10s, 30s)",        // uniform
+        "normal(20s, 5s)",          // gaussian
+        "exponential(15s)",         // Poisson / bursty
+        "2s"                        // constant cadence (max burst)
+    }, /*editable=*/true);
+    addLocal("taskDuration");
+    addLocal("bumpDroppedPriority");
+    addLocal("costEnergyWeight");
+    addLocal("costHaltPriorityWeight");
+    addLocal("costHaltGroupSizeWeight");
+    addLocal("costMbsRelocationWeight");
+    addBroadcast("drone_comm_range",    "^.^.drone", numDrones, "drone_comm_range");
+    addBroadcast("commTimeoutDuration", "^.^.drone", numDrones, "commTimeoutDuration");
+    addBroadcast("mbs_comm_range",      "^.^.mbs",   numMbs,    "mbs_comm_range");
+    addBroadcast("drone_speed",         "^.^.drone", numDrones, "speed");
+    addBroadcast("mbs_speed",           "^.^.mbs",   numMbs,    "speed");
+
+    // Helper: write parsed value into primary + every broadcast target.
+    // For STRING-typed params we accept unquoted user input (e.g. "FIFO"
+    // from a dropdown) and re-add the quotes that cPar::parse() expects.
+    auto displayValue = [](cPar& p) -> std::string {
+        std::string s = p.str();
+        if (p.getType() == cPar::STRING && s.size() >= 2 &&
+            s.front() == '"' && s.back() == '"') {
+            return s.substr(1, s.size() - 2);
+        }
+        return s;
+    };
+    auto toParseValue = [](cPar& p, const std::string& v) -> std::string {
+        if (p.getType() == cPar::STRING) {
+            if (v.size() >= 2 && v.front() == '"' && v.back() == '"') return v;
+            // Escape any embedded quotes/backslashes the user might type.
+            std::string esc;
+            esc.reserve(v.size() + 2);
+            esc.push_back('"');
+            for (char c : v) {
+                if (c == '\\' || c == '"') esc.push_back('\\');
+                esc.push_back(c);
+            }
+            esc.push_back('"');
+            return esc;
+        }
+        return v;
+    };
+
+    auto applyValue = [&](const Row& r, const std::string& vRaw, std::string& warnOut) {
+        std::string current = displayValue(*r.primary);
+        if (vRaw == current) return true;       // unchanged -> skip
+        std::string v = toParseValue(*r.primary, vRaw);
+        try {
+            r.primary->parse(v.c_str());
+            for (cPar* extra : r.broadcastTo) extra->parse(v.c_str());
+            return true;
+        } catch (std::exception& e) {
+            warnOut = std::string("could not parse '") + vRaw + "' for " +
+                      r.label + " (" + e.what() + ") -- keeping default";
+            return false;
+        }
+    };
+
+    // ---- Path A: Qt GUI form (Qtenv only) ----
+    if (isQtGuiAvailable()) {
+        std::vector<ParamFieldSpec> fields;
+        fields.reserve(rows.size());
+        for (auto& r : rows) {
+            ParamFieldSpec spec;
+            spec.label    = r.label;
+            spec.value    = displayValue(*r.primary);
+            spec.hint     = r.hint;
+            spec.choices  = r.choices;
+            spec.editable = r.editable;
+            fields.push_back(std::move(spec));
+        }
+
+        bool accepted = showParamDialog(
+            fields, "UAV Swarm TA -- simulation parameters");
+        if (!accepted) {
+            EV << "ask_user: dialog cancelled; keeping all ini defaults.\n";
+            return;
+        }
+
+        for (size_t i = 0; i < rows.size(); ++i) {
+            std::string warn;
+            if (applyValue(rows[i], fields[i].value, warn)) {
+                EV << "ask_user: " << rows[i].label << " = "
+                   << rows[i].primary->str()
+                   << (rows[i].broadcastTo.empty() ? "" : "  (broadcast)") << "\n";
+            } else {
+                EV_WARN << "ask_user: " << warn << "\n";
+            }
+        }
+        return;
+    }
+
+    // ---- Path B: text prompt fallback (Cmdenv / no GUI) ----
+    std::string defaultLine;
+    for (size_t i = 0; i < rows.size(); i++) {
+        if (i) defaultLine += "; ";
+        defaultLine += rows[i].label + "=" + displayValue(*rows[i].primary);
+    }
+    std::string answer = getEnvir()->gets(
+        "Edit tunable parameters (semicolon-separated name=value pairs):",
+        defaultLine.c_str());
+    if (answer.empty() || answer == defaultLine) {
+        EV << "ask_user: keeping all ini defaults.\n";
+        return;
+    }
+
+    std::map<std::string, std::string> kv;
+    size_t pos = 0;
+    while (pos < answer.size()) {
+        size_t semi = answer.find(';', pos);
+        std::string token = answer.substr(pos, semi - pos);
+        pos = (semi == std::string::npos) ? answer.size() : semi + 1;
+        size_t start = token.find_first_not_of(" \t");
+        if (start == std::string::npos) continue;
+        size_t end = token.find_last_not_of(" \t");
+        token = token.substr(start, end - start + 1);
+        size_t eq = token.find('=');
+        if (eq == std::string::npos) {
+            EV_WARN << "ask_user: ignoring malformed token '" << token << "'\n";
+            continue;
+        }
+        std::string name  = token.substr(0, eq);
+        std::string value = token.substr(eq + 1);
+        while (!name.empty() && (name.back() == ' ' || name.back() == '\t')) name.pop_back();
+        while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) value.erase(0, 1);
+        kv[name] = value;
+    }
+
+    for (auto& r : rows) {
+        auto it = kv.find(r.label);
+        if (it == kv.end()) continue;
+        std::string warn;
+        if (applyValue(r, it->second, warn)) {
+            EV << "ask_user: " << r.label << " = " << r.primary->str()
+               << (r.broadcastTo.empty() ? "" : "  (broadcast)") << "\n";
+        } else {
+            EV_WARN << "ask_user: " << warn << "\n";
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
 // INITIALIZATION
 // -----------------------------------------------------------------------
 void MainNodeApp::initialize(int stage) {
@@ -50,6 +262,26 @@ void MainNodeApp::initialize(int stage) {
         taskCounter = 0;
         maxQueueSize = 50;
         commRange = 1e9;  // mainNode is "god mode"; no link is range-limited
+
+        // Hide the mainNode submodule from Qtenv. MobileHost inherits an
+        // icon from INET; setting `i=` in NED isn't always enough to clear
+        // it, so we override the host's display tags at runtime. Done here
+        // (stage 0) so the hide takes effect before Qtenv first renders.
+        cDisplayString& hostDS = getParentModule()->getDisplayString();
+        hostDS.setTagArg("i", 0, "");          // no icon
+        hostDS.setTagArg("i2", 0, "");         // no overlay icon either
+        hostDS.setTagArg("b", 0, "1");         // 1x1 bounding box
+        hostDS.setTagArg("b", 1, "1");
+        hostDS.setTagArg("is", 0, "vs");       // very small in case b is ignored
+        hostDS.setTagArg("p", 0, "-10000");    // off the visible 2000x2000 canvas
+        hostDS.setTagArg("p", 1, "-10000");
+        hostDS.setTagArg("t", 0, "");          // clear any text label
+
+        // OPTIONAL prompt: if the ini sets ask_user=true, pop a single dialog
+        // for every tunable BEFORE we cache any values below.
+        if (par("ask_user").boolValue()) {
+            promptUserForParameters();
+        }
 
         std::string algo = par("algorithmType").stringValue();
         if (algo == "AUCTION" || algo == "COST") {
