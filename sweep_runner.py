@@ -5,38 +5,55 @@ Drives the release `UavSwarmTA` binary headlessly (Cmdenv), iterating over
 2 or 3 ini parameters and collecting per-task CSVs into a sweep folder
 under `sim_data/`. Sequential execution; each sweep point is run N times.
 
-Layout produced for 2 params `{algorithmType: [FIFO, COST], taskLimit: [10, 50]}`
-with `repetitions = 3`::
+The allocator algorithm is controlled by a dedicated `algorithm` argument
+(not by `sweep_params`). Pass `algorithm="FIFO"` (default), `"COST"`, or
+`"both"`. With `"both"`, the full sweep is run twice -- once per algorithm --
+and the two result trees land in sibling subfolders so they can be loaded
+side-by-side for comparison plots. The algorithm folder is always created,
+even for a single algorithm, so downstream tooling can rely on a uniform
+layout.
+
+Layout produced for `sweep_params={"*.numDrones": [10, 15], "*.numMbs": [3, 5]}`
+with `repetitions = 3` and `algorithm = "both"`::
 
     sim_data/<sweep_label>/
-      sweep_manifest.json              # full spec (params + value lists + rep count)
-      sweep.log                        # top-level log (one line per run)
-      algorithmType=COST/
-        taskLimit=10/
-          sweep.ini                    # exact ini handed to the binary (one per cell)
-          rep0-tasks.csv
-          rep0.log                     # stdout/stderr of that run
-          rep1-tasks.csv
-          rep1.log
+      combined_manifest.json           # lists algorithms run + per-algo summary
+      FIFO/
+        sweep_manifest.json            # full spec (params + value lists + rep count)
+        sweep.log                      # top-level log (one line per run)
+        numDrones=10/
+          numMbs=3/
+            sweep.ini                  # exact ini handed to the binary (one per cell)
+            rep0-tasks.csv
+            rep0.log                   # stdout/stderr of that run
+            rep1-tasks.csv
+            rep1.log
+            ...
+          numMbs=5/
+            ...
+        numDrones=15/
           ...
-      algorithmType=FIFO/
-        ...
+      COST/
+        ...                            # mirrors FIFO/ subtree
 
 Usage as a library::
 
-    from sweep_runner import run_sweep
+    from sweep_runner import setup_environment, run_sweep
+    setup_environment()  # once per Python session
     run_sweep(
-        sweep_params={"algorithmType": ['"FIFO"', '"COST"'],
-                      "taskLimit":     [10, 50, 100]},
+        sweep_params={"*.numDrones": [10, 15, 20],
+                      "*.numMbs":    [3, 5, 7]},
         repetitions=5,
-        label="alg_vs_load",
+        algorithm="both",
+        label="drones_x_mbs",
     )
 
 CLI::
 
-    python sweep_runner.py --param 'algorithmType=["FIFO","COST"]' \
-                           --param 'taskLimit=[10,50,100]' \
-                           --repetitions 5 --label alg_vs_load
+    python sweep_runner.py --param '*.numDrones=[10,15,20]' \
+                           --param '*.numMbs=[3,5,7]' \
+                           --algorithm both \
+                           --repetitions 5 --label drones_x_mbs
 """
 
 from __future__ import annotations
@@ -372,33 +389,97 @@ def _run_one(
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
+_VALID_ALGORITHMS = ("FIFO", "FIFO_PRIO", "FIFO_PREEMPT", "COST")
+_ALGORITHM_GROUPS = {
+    "BOTH":     ["FIFO", "COST"],                            # legacy: baseline pair
+    "ALL":      list(_VALID_ALGORITHMS),                     # every implemented variant
+    "FIFO_ALL": ["FIFO", "FIFO_PRIO", "FIFO_PREEMPT"],       # the three FIFO families
+}
+
+
+def _normalize_algorithm(algorithm: Any) -> List[str]:
+    """Turn the user-facing `algorithm` arg into a list of algo names.
+
+    Accepts:
+      * `"FIFO"`, `"FIFO_PRIO"`, `"FIFO_PREEMPT"`, `"COST"` (case-insensitive)
+        -> single-algo list
+      * `"both"`     -> ["FIFO", "COST"]                (legacy baseline pair)
+      * `"all"`      -> every implemented variant       (4 algos)
+      * `"fifo_all"` -> the three FIFO variants
+      * an iterable of any of the above -> deduped & order-preserved
+    """
+    if algorithm is None:
+        return ["FIFO"]
+    if isinstance(algorithm, str):
+        s = algorithm.strip().upper()
+        if s in _ALGORITHM_GROUPS:
+            return list(_ALGORITHM_GROUPS[s])
+        if s in _VALID_ALGORITHMS:
+            return [s]
+        raise ValueError(
+            f"Unknown algorithm {algorithm!r}. "
+            f"Expected one of: {list(_VALID_ALGORITHMS)}, "
+            f"or a group keyword: {sorted(_ALGORITHM_GROUPS)} "
+            f"(or a list of any of those)."
+        )
+    # Iterable case.
+    out: List[str] = []
+    for item in algorithm:
+        for a in _normalize_algorithm(item):
+            if a not in out:
+                out.append(a)
+    if not out:
+        raise ValueError("algorithm list is empty.")
+    return out
+
+
 def run_sweep(
     sweep_params: Dict[str, Sequence[Any]],
     repetitions: int = 5,
     label: Optional[str] = None,
+    algorithm: Any = "FIFO",
     extra_overrides: Optional[Dict[str, Any]] = None,
     timeout_sec: Optional[float] = None,
     output_root: Optional[Path] = None,
 ) -> Path:
     """Run a sweep over `sweep_params` (2 or 3 keys), `repetitions` times each.
 
+    Output layout (uniform whether one or both algorithms are selected)::
+
+        sim_data/<label>/
+          combined_manifest.json   # algorithms run, sweep spec, paths
+          FIFO/
+            sweep.log
+            sweep_manifest.json
+            <dim1>=.../<dim2>=.../repN-tasks.csv
+          COST/
+            ...
+
     Parameters
     ----------
     sweep_params : dict[str, list]
-        Keys are bare ini param names (e.g. "algorithmType"); the runner
-        prepends `*.mainNode.app[0].`. Values in each list are written
-        VERBATIM after `=` in the generated ini, so string params need
-        embedded quotes ('"FIFO"'), numeric params with units need units
-        ("10s"), etc.
+        Keys are bare ini param names (e.g. "taskLimit"); the runner prepends
+        `*.mainNode.app[0].` automatically (see `_full_param_name`). Values
+        are written VERBATIM after `=`, so string params need embedded
+        quotes ('"FIFO"') and numeric params need units ("10s").
     repetitions : int
-        How many runs per sweep cell. Each run uses a different OMNeT++
-        runnumber (-r 0, -r 1, ...) so seed-set differs and stats vary.
+        Number of runs per sweep cell, per algorithm. Each uses a different
+        OMNeT++ runnumber (-r 0, -r 1, ...) so seed-set differs.
     label : str, optional
-        Short name for the sweep; becomes the folder name under sim_data/.
+        Short name for the sweep; becomes the folder under sim_data/.
         Defaults to a timestamp.
+    algorithm : str or list, default "FIFO"
+        Which allocator(s) to sweep with. Independent of `sweep_params` so
+        the same dimensions are run for each algorithm and the two trees
+        can be plotted side-by-side. Accepted:
+          * "FIFO" or "COST"             -> single algorithm
+          * "both" / "all"               -> both, sequentially
+          * ["FIFO", "COST"]             -> explicit list
+        Conflicts with `algorithmType` in `extra_overrides`.
     extra_overrides : dict, optional
         Additional ini overrides held constant across all sweep cells
-        (same value/format rules as sweep_params).
+        (same value/format rules as sweep_params). NOTE: passing
+        `algorithmType` here is rejected -- use the `algorithm` arg instead.
     timeout_sec : float, optional
         Per-run wall-clock cap. None = no limit.
     output_root : Path, optional
@@ -407,20 +488,82 @@ def run_sweep(
     Returns
     -------
     Path
-        The top-level sweep folder, ready for downstream aggregation.
+        The top-level sweep folder. Contains one subfolder per algorithm,
+        plus a combined manifest pointing into each.
     """
     _validate_sweep(sweep_params)
     extra_overrides = dict(extra_overrides or {})
+    algorithms = _normalize_algorithm(algorithm)
+
+    # Reject ambiguous spec: the algorithm arg owns algorithmType.
+    for k in list(extra_overrides):
+        if _full_param_name(k) == f"{_MAINNODE_PREFIX}algorithmType":
+            raise ValueError(
+                f"extra_overrides contains '{k}', which collides with the "
+                f"`algorithm` argument. Drop it from extra_overrides and "
+                f"pass `algorithm={extra_overrides[k]!r}` (or 'both') instead."
+            )
+
     _check_environment()
 
     root = (output_root or SIM_DATA_DIR).resolve()
     sweep_name = label or datetime.now().strftime("sweep_%Y-%m-%d_%H-%M-%S")
-    sweep_dir = root / _sanitize_for_path(sweep_name)
-    sweep_dir.mkdir(parents=True, exist_ok=True)
+    top_dir = root / _sanitize_for_path(sweep_name)
+    top_dir.mkdir(parents=True, exist_ok=True)
 
-    # Logging: a top-level sweep.log next to a per-run rep<N>.log inside
-    # each cell. The top-level one summarises start/end + exit status of
-    # every run so you can grep it for failures quickly.
+    combined = {
+        "label":         sweep_name,
+        "generated_at":  datetime.now().isoformat(timespec="seconds"),
+        "algorithms":    algorithms,
+        "sweep_params":  {k: list(v) for k, v in sweep_params.items()},
+        "repetitions":   repetitions,
+        "extra_overrides": extra_overrides,
+        "runs":          {},   # algo -> {sweep_dir, n_failures, elapsed_sec}
+    }
+
+    start_all = time.monotonic()
+    for algo in algorithms:
+        algo_dir = top_dir / algo
+        algo_dir.mkdir(parents=True, exist_ok=True)
+        algo_overrides = dict(extra_overrides)
+        # Re-add quotes for ini parse() (string param).
+        algo_overrides["algorithmType"] = f'"{algo}"'
+
+        summary = _run_single_sweep(
+            sweep_params=sweep_params,
+            repetitions=repetitions,
+            sweep_dir=algo_dir,
+            sweep_name=f"{sweep_name}/{algo}",
+            extra_overrides=algo_overrides,
+            timeout_sec=timeout_sec,
+        )
+        combined["runs"][algo] = {
+            "sweep_dir":   str(algo_dir.relative_to(top_dir)),
+            "n_failures":  summary["n_failures"],
+            "elapsed_sec": summary["elapsed_sec"],
+            "n_runs":      summary["n_runs"],
+        }
+
+    combined["total_elapsed_sec"] = round(time.monotonic() - start_all, 3)
+    (top_dir / "combined_manifest.json").write_text(json.dumps(combined, indent=2))
+
+    return top_dir
+
+
+def _run_single_sweep(
+    sweep_params: Dict[str, Sequence[Any]],
+    repetitions: int,
+    sweep_dir: Path,
+    sweep_name: str,
+    extra_overrides: Dict[str, Any],
+    timeout_sec: Optional[float],
+) -> Dict[str, Any]:
+    """Execute one full sweep (all cells x all reps) for a single algorithm.
+
+    Writes `sweep.log` + `sweep_manifest.json` inside `sweep_dir`, plus the
+    per-cell tree underneath. Returns a small summary dict for the combined
+    manifest at the parent level.
+    """
     _configure_top_log(sweep_dir / "sweep.log")
     logger.info("Sweep '%s' starting -- output dir: %s", sweep_name, sweep_dir)
     logger.info("Sweep dimensions: %s", {k: list(v) for k, v in sweep_params.items()})
@@ -504,7 +647,11 @@ def run_sweep(
     manifest["n_failures"]  = n_failures
     (sweep_dir / "sweep_manifest.json").write_text(json.dumps(manifest, indent=2))
 
-    return sweep_dir
+    return {
+        "n_failures":  n_failures,
+        "elapsed_sec": round(elapsed, 3),
+        "n_runs":      total_runs,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +711,16 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--extra", action="append", default=[], metavar="NAME=VALUE",
                    help="Extra ini override held constant across all cells. "
                         "Value is written verbatim. Repeatable.")
+    p.add_argument("--algorithm", "-a", default="FIFO",
+                   choices=["FIFO", "FIFO_PRIO", "FIFO_PREEMPT", "COST",
+                            "both", "all", "fifo_all"],
+                   help="Allocator(s) to sweep with. Group keywords: "
+                        "'both' = FIFO+COST (legacy baseline pair), "
+                        "'all' = every implemented variant (4 algos), "
+                        "'fifo_all' = the three FIFO variants. "
+                        "Each algorithm's results land under "
+                        "sim_data/<label>/<ALGO>/ for side-by-side "
+                        "comparison (default: FIFO).")
     args = p.parse_args(argv)
 
     sweep_params: Dict[str, List[Any]] = {}
@@ -583,6 +740,7 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
             sweep_params=sweep_params,
             repetitions=args.repetitions,
             label=args.label,
+            algorithm=args.algorithm,
             extra_overrides=extra_overrides,
             timeout_sec=args.timeout,
         )
