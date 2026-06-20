@@ -1,5 +1,10 @@
 /*
  * MbsApp.cc
+ *
+ * Mobile Base Station behaviour. The MBS owns a list of covered tasks and
+ * a target position; the actual flying is delegated to DroneMobility (the
+ * same class drones use). All state changes come from MainNodeApp via
+ * direct calls -- there are no inbound network messages.
  */
 #include "MbsApp.h"
 
@@ -7,6 +12,8 @@ namespace uavswarmta {
 
 Define_Module(MbsApp);
 
+// Cache NED params and snapshot the starting position as the initial target
+// (so an MBS that never gets assigned a task stays put).
 void MbsApp::initialize(int stage) {
     if (stage == 0) {
         mbsId = getParentModule()->getIndex();
@@ -23,23 +30,31 @@ void MbsApp::initialize(int stage) {
     }
 }
 
+// MBS has no inbound network messages; only its own (unused) self-messages
+// might reach this method. Defensive cleanup, never expected to fire.
 void MbsApp::handleMessage(cMessage *msg) {
-    // No network input; just discard any unexpected messages.
     if (msg->isSelfMessage()) return;
     delete msg;
 }
 
+// First task picked up by an idle MBS: record it and fly straight to the
+// task site (the only covered task, so no centroid math needed).
 void MbsApp::assignInitialTask(int taskId, double targetX, double targetY) {
     Enter_Method("assignInitialTask");
     assignedTasks.push_back(taskId);
     shiftPosition(targetX, targetY);
 }
 
+// Mark a task as covered without moving. MainNodeApp's MBS picker has
+// already verified that the current position keeps every drone in range;
+// a recentre via shiftPosition() is a separate decision the caller makes.
 void MbsApp::addCoveredTask(int taskId) {
     Enter_Method("addCoveredTask");
     assignedTasks.push_back(taskId);
 }
 
+// Forget a covered task (because it COMPLETED, was DROPPED, or this MBS
+// was unassigned during a RELOCATE-AND-DROP). Logs IDLE on the last drop.
 void MbsApp::removeTask(int taskId) {
     Enter_Method("removeTask");
     auto it = std::find(assignedTasks.begin(), assignedTasks.end(), taskId);
@@ -51,6 +66,9 @@ void MbsApp::removeTask(int taskId) {
     }
 }
 
+// Command the mobility to drive to (newX, newY) at our configured speed.
+// MainNodeApp passes the centroid of all currently-covered tasks so the
+// MBS stays equidistant from every drone it's serving.
 void MbsApp::shiftPosition(double newX, double newY) {
     Enter_Method("shiftPosition");
     targetPos = inet::Coord(newX, newY, mobility->getCurrentPosition().z);

@@ -1,5 +1,10 @@
 /*
  * DroneMobility.cc
+ *
+ * Implementation of the simple "fly to target, then stop" mobility shared
+ * by both drones and MBSs. We piggyback on INET's MovingMobilityBase to
+ * inherit periodic position updates and the IMobility query surface used
+ * by the apps (DroneApp::hasConnection, MainNodeApp's distance math).
  */
 #include "DroneMobility.h"
 
@@ -9,6 +14,10 @@ namespace uavswarmta {
 
 Define_Module(DroneMobility);
 
+// Two-stage init. We only need stage LOCAL: start the module in a stopped
+// state so it doesn't spin the update timer until setTarget() switches it
+// on. MovingMobilityBase::initialize handles the rest (parses initial
+// position, etc.).
 void DroneMobility::initialize(int stage)
 {
     MovingMobilityBase::initialize(stage);
@@ -20,6 +29,10 @@ void DroneMobility::initialize(int stage)
     }
 }
 
+// MovingMobilityBase callback: advance position based on velocity. Called
+// at each scheduled update tick. We snap to the target (and stop the
+// periodic ticker) once we reach -- or just past -- the planned arrival
+// time, otherwise integrate linearly.
 void DroneMobility::move()
 {
     if (!moving) {
@@ -44,6 +57,12 @@ void DroneMobility::move()
     lastPosition += lastVelocity * dt;
 }
 
+// Re-aim the module at a new (target, speed). Settles the current position
+// up to "now" first so a mid-flight redirect doesn't lose the partial
+// progress already made on the old leg.
+//   * dist < 1e-6 or speed <= 0  => snap to target and stay put
+//   * otherwise                  => set velocity = direction*speed and
+//                                   schedule arrival at simTime()+dist/speed
 void DroneMobility::setTarget(const inet::Coord& target, double speed)
 {
     Enter_Method("setTarget");

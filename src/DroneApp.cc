@@ -1,5 +1,28 @@
 /*
  * DroneApp.cc
+ *
+ * Per-drone application logic. One instance lives inside each drone[i]
+ * host. The drone is purely reactive -- the central MainNodeApp decides
+ * what to do and when via direct method calls (assignTask, preempt,
+ * extendRemainingDuration); the drone reports back through the same
+ * channel (MainNodeApp::onTaskCompletion / onTaskDropNotification).
+ *
+ * State machine (see enum DroneState):
+ *   IDLE  --assignTask-->  TRAVELLING  --arrival-->  PERFORMING_TASK
+ *                                                       |
+ *                                                       v
+ *                          completion timer  -->  IDLE
+ *
+ *   Side branches from any non-DEAD state:
+ *     * connection lost mid-task  -> WAITING_FOR_CONNECTION (timer:
+ *                                    commTimeoutDuration). Resume on
+ *                                    reconnect, otherwise RETURNING_HOME.
+ *     * low battery               -> HEADING_TO_RECHARGE -> RECHARGING -> IDLE
+ *     * battery hits zero         -> die() -> DEAD (terminal)
+ *
+ * Energy accounting is a pure integration (power * dt) settled at every
+ * state change and on the 1-second connectionCheckTimer tick so we notice
+ * a low battery DURING a long task, not just at transitions.
  */
 #include "DroneApp.h"
 #include "MainNodeApp.h"
@@ -8,6 +31,8 @@ namespace uavswarmta {
 
 Define_Module(DroneApp);
 
+// All five self-message timers are owned by us; cancelAndDelete handles
+// both the cancel and the free safely whether or not the timer is scheduled.
 DroneApp::~DroneApp() {
     cancelAndDelete(arrivalTimer);
     cancelAndDelete(taskCompletionTimer);
@@ -16,6 +41,11 @@ DroneApp::~DroneApp() {
     cancelAndDelete(rechargeTimer);
 }
 
+// Two-stage init:
+//   stage 0 -- cache NED params, set up the mobility + comm-range circle,
+//              allocate the self-message timers we will reuse later.
+//   stage 1 -- resolve sibling modules (mainNode + its home position). Done
+//              in stage 1 because mainNode is built in stage 0 alongside us.
 void DroneApp::initialize(int stage) {
     if (stage == 0) {
         droneId = getParentModule()->getIndex();
@@ -71,6 +101,13 @@ void DroneApp::initialize(int stage) {
 // =======================================================================
 // PUBLIC: called by MainNodeApp::dispatchUnits()
 // =======================================================================
+// Hand the drone a new task. Caller has already done the eligibility checks
+// and computed `syncedTravelTime` so every drone on the same task starts
+// work at the same instant (the longest of (each drone's travel time, the
+// MBS travel time)). Side-effects:
+//   * resolves the assigned MBS so hasConnection() can monitor link distance
+//   * commands the mobility to actually fly to the target
+//   * schedules arrivalTimer at the synced ETA
 void DroneApp::assignTask(int taskId, double syncedTravelTime, double duration,
                           double targetX, double targetY, int mbsId) {
     Enter_Method("assignTask");
@@ -156,6 +193,10 @@ void DroneApp::extendRemainingDuration(double scaleFactor) {
 // =======================================================================
 // MAIN MESSAGE ROUTER
 // =======================================================================
+// Five self-message timers, plus a catch-all delete for anything else.
+// A DEAD drone silently drops every incoming message (its own self-msgs
+// have all been cancelled by die(), so this branch only protects against
+// late stragglers from peer modules).
 void DroneApp::handleMessage(cMessage *msg) {
     if (currentState == DEAD) {
         if (msg->isSelfMessage()) return;  // owned by us, do not delete
@@ -175,12 +216,20 @@ void DroneApp::handleMessage(cMessage *msg) {
 // =======================================================================
 // CONNECTION / ENERGY / DEATH
 // =======================================================================
+// Link-budget check: a drone is "connected" iff its Euclidean distance to
+// the MBS currently covering its task is within commRange. The MBS may be
+// moving (it's an unmanned base station), so this is rechecked on every
+// connectionCheckTimer tick during PERFORMING_TASK / WAITING_FOR_CONNECTION.
 bool DroneApp::hasConnection() {
     if (mbsMobility == nullptr) return false;
     double distance = mobility->getCurrentPosition().distance(mbsMobility->getCurrentPosition());
     return distance <= commRange;
 }
 
+// Connection just dropped mid-task. Snapshot how much work is left,
+// suspend the completion timer, switch to WAITING_FOR_CONNECTION and start
+// a countdown -- if the MBS doesn't return within commTimeoutDuration the
+// drone gives up via handleConnectionTimeout() (-> returns home + drops).
 void DroneApp::handleConnectionLoss() {
     EV << "Drone " << droneId << " lost connection! Pausing Task #" << currentTaskId
        << " and waiting for " << commTimeoutDuration << "s.\n";
@@ -196,6 +245,9 @@ void DroneApp::handleConnectionLoss() {
     scheduleAt(simTime() + commTimeoutDuration, connectionTimeoutTimer);
 }
 
+// Integrate power draw over the time since the previous settle. State picks
+// the power profile (idle / travel / work / recharge). Reaching zero kills
+// the drone; falling under energyThreshold queues a recharge trip.
 void DroneApp::updateEnergy() {
     if (currentState == DEAD) return;
 
@@ -221,6 +273,10 @@ void DroneApp::updateEnergy() {
     }
 }
 
+// Terminal state: battery hit zero. If a task was in flight we tell the
+// main node so its bookkeeping can decrement the team count (and possibly
+// finalize the task as DROPPED). All timers are cancelled, mobility is
+// frozen, and the icon turns red. No transitions out of DEAD.
 void DroneApp::die() {
     EV << "Drone " << droneId << " HAS RUN OUT OF ENERGY! Shutting down completely.\n";
 
@@ -249,6 +305,8 @@ void DroneApp::die() {
     getParentModule()->getDisplayString().setTagArg("i", 1, "red");
 }
 
+// Recharge stations are co-located with MBSs (plus the mainNode home as a
+// fallback). Pick whichever is currently closest to our position.
 inet::Coord DroneApp::findClosestRechargeStation() {
     inet::Coord myPos = mobility->getCurrentPosition();
     inet::Coord closestPos = homePosition;
@@ -269,6 +327,9 @@ inet::Coord DroneApp::findClosestRechargeStation() {
     return closestPos;
 }
 
+// Battery dipped under threshold while non-RECHARGING. Save how much work
+// was left on the current task (so the main node can re-allocate it after
+// we drop), cancel its timers, head to the closest recharge station.
 void DroneApp::initiateRecharge() {
     EV << "Drone " << droneId << " energy critical! Aborting and heading to recharge.\n";
 
@@ -293,6 +354,9 @@ void DroneApp::initiateRecharge() {
 // =======================================================================
 // FLY HELPER
 // =======================================================================
+// Issue a setTarget() to the mobility AND schedule arrivalTimer at the ETA,
+// so the state machine knows when the drone has actually arrived. Replaces
+// any in-flight goal (caller is responsible for state consistency).
 void DroneApp::flyTo(const inet::Coord& target) {
     double speed = par("speed").doubleValue();
     double dist = mobility->getCurrentPosition().distance(target);
@@ -307,6 +371,13 @@ void DroneApp::flyTo(const inet::Coord& target) {
 // =======================================================================
 // EVENT HANDLERS
 // =======================================================================
+// arrivalTimer fired: we just reached our flyTo() target. What happens next
+// depends on WHY we were flying:
+//   * TRAVELLING (en route to a task)   -> start work if MBS is in range,
+//                                          otherwise enter WAITING_FOR_CONNECTION
+//   * RETURNING_HOME (after timeout)    -> back to IDLE, report drop
+//   * HEADING_TO_RECHARGE               -> begin RECHARGING countdown,
+//                                          report drop if a task was held
 void DroneApp::handleArrival() {
     updateEnergy();
     if (currentState == DEAD) return;
@@ -340,6 +411,13 @@ void DroneApp::handleArrival() {
     }
 }
 
+// Periodic (1 Hz) tick scheduled while PERFORMING_TASK or
+// WAITING_FOR_CONNECTION. Three jobs:
+//   1. settle the energy account (catches a low battery DURING a long task)
+//   2. detect new connection loss (PERFORMING_TASK -> WAITING_FOR_CONNECTION)
+//   3. resume a paused task once the MBS is back in range (WAITING -> PERFORMING)
+// Re-arms itself for another second while still in either of the two
+// monitored states.
 void DroneApp::handleConnectionCheck() {
     // Periodically settle energy so we notice a low battery DURING a long task
     // (otherwise updateEnergy only runs at state transitions).
@@ -365,6 +443,9 @@ void DroneApp::handleConnectionCheck() {
     }
 }
 
+// commTimeoutDuration elapsed while WAITING_FOR_CONNECTION. The MBS never
+// came back -- give up on the task and fly home. The drop is reported when
+// arrivalTimer fires at home (see handleArrival's RETURNING_HOME branch).
 void DroneApp::handleConnectionTimeout() {
     // Decide what to do before charging energy (so even a death below still
     // notifies the main node about the dropped task).
@@ -376,6 +457,9 @@ void DroneApp::handleConnectionTimeout() {
     updateEnergy();
 }
 
+// taskCompletionTimer fired: our share of the work is done. We notify the
+// main node BEFORE settling energy so the completion is reported even if
+// the energy update kills us or triggers a recharge run.
 void DroneApp::handleTaskCompletion() {
     // The work is done as of *this* event -- report it before anything else,
     // so that even if updateEnergy() kills us or sends us off to recharge,
@@ -389,6 +473,8 @@ void DroneApp::handleTaskCompletion() {
     updateEnergy();
 }
 
+// rechargeDuration elapsed at a station -- top up the battery, switch back
+// to IDLE, clear the yellow status icon. The drone is now allocatable again.
 void DroneApp::handleRechargeCompletion() {
     currentEnergy = par("initialEnergy").doubleValue();
     lastEnergyUpdateTime = simTime();
@@ -401,6 +487,8 @@ void DroneApp::handleRechargeCompletion() {
 // =======================================================================
 // DIRECT-CALL OUTPUTS (replaces UDP socket sends)
 // =======================================================================
+// Tell the main node a task finished successfully. Cleared local task
+// state so a subsequent assignTask() lands cleanly.
 void DroneApp::sendTaskCompletion() {
     if (currentTaskId == -1) return;
     if (mainApp != nullptr) {
@@ -412,6 +500,9 @@ void DroneApp::sendTaskCompletion() {
     mbsMobility = nullptr;
 }
 
+// Tell the main node we are abandoning the current task (death, recharge,
+// connection timeout). savedRemainingDuration carries the work still left,
+// so the allocator can decide whether peers can absorb it.
 void DroneApp::sendTaskDropNotification() {
     if (currentTaskId == -1) return;
     EV << "Reporting TaskDropNotification for Task #" << currentTaskId << ".\n";
@@ -422,6 +513,9 @@ void DroneApp::sendTaskDropNotification() {
     mbsMobility = nullptr;
 }
 
+// Convenience wrapper used by other state transitions: report a zero-work
+// drop and return to IDLE without going through the fly-home / recharge
+// machinery. (Kept for callers that already settled state themselves.)
 void DroneApp::dropTaskAndWait() {
     EV << "Drone " << droneId << " is dropping Task #" << currentTaskId
        << " due to connection loss/low battery!\n";

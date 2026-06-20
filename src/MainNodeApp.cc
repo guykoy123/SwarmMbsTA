@@ -1,5 +1,33 @@
 /*
  * MainNodeApp.cc
+ *
+ * Central task allocator + scheduler for the UAV swarm. One instance lives
+ * inside the singleton `mainNode` host (see SwarmNetwork.ned). It is
+ * deliberately the only place that decides which drones/MBSs serve which
+ * task; the drone/MBS apps just execute orders and report back via the
+ * direct-call API (onTaskCompletion / onTaskDropNotification).
+ *
+ * Responsibilities (one section per banner below):
+ *   - Queue ordering           (compareTaskPriority + cQueue setup)
+ *   - Optional GUI/CLI prompt  (promptUserForParameters)
+ *   - Init / NED parsing       (initialize -- caches tunables, builds the
+ *                              priority CDF, halt-weight table and per-
+ *                              priority queue-wait deadline table)
+ *   - Self-message router      (handleMessage -- generator + deadlines)
+ *   - Task generation          (generateNewTask + drawTaskPriority,
+ *                              schedules an optional EXPIRED-deadline timer)
+ *   - Drone/MBS update path    (onTaskCompletion / onTaskDropNotification
+ *                              -> handleTaskUpdate -> finalizeTask)
+ *   - Allocators               (assignTaskFifo for FIFO/FIFO_PRIO/
+ *                              FIFO_PREEMPT, assignTaskCost for COST)
+ *   - Canvas markers + HUD     (addTaskFigure / refreshStatsPanel ...)
+ *   - Per-task CSV log         (openCsv + writeCsvRow, one row per
+ *                              finalized task; outcome enum documented
+ *                              above writeCsvRow)
+ *
+ * Priority convention everywhere: integers 1..priorityLevels where
+ *   1 = HIGH urgency (front of queue, shortest deadline)
+ *   priorityLevels = LOW urgency (back of queue, longest deadline).
  */
 #include "MainNodeApp.h"
 #include <limits>
@@ -16,7 +44,15 @@ namespace uavswarmta {
 Define_Module(MainNodeApp);
 
 MainNodeApp::~MainNodeApp() {
+    // Deletion order matters: cancel timers BEFORE touching the queue
+    // (deadline-timer cancellation does not depend on queue state, but the
+    // reverse would briefly leave timers pointing at freed task ids).
     cancelAndDelete(generateTaskTimer);
+    // Cancel + delete any pending per-task deadline timers.
+    for (auto& kv : taskDeadlineTimers) {
+        cancelAndDelete(kv.second);
+    }
+    taskDeadlineTimers.clear();
     taskQueue.clear();
     if (csvOut.is_open()) csvOut.close();
 
@@ -73,6 +109,14 @@ void MainNodeApp::promptUserForParameters() {
         const char* u = p.getUnit();
         return u ? std::string("unit: ") + u : std::string();
     };
+    // addLocal     -> free-text row for a param owned by this module.
+    // addLocalChoice -> same, but the GUI shows a dropdown (editable=true
+    //                   keeps the field typeable so users can supply
+    //                   custom values not in the preset list).
+    // addBroadcast -> single row whose value is fanned out to the named
+    //                 param on every drone[i].app[0] or mbs[i].app[0]
+    //                 submodule -- so the user sets e.g. drone_comm_range
+    //                 once and every drone picks it up.
     auto addLocal = [&](const char* name) {
         cPar& p = par(name);
         rows.push_back({name, unitHint(p), &p, {}, {}, false});
@@ -101,8 +145,18 @@ void MainNodeApp::promptUserForParameters() {
         if (r.primary) rows.push_back(std::move(r));
     };
 
-    // algorithmType: strict dropdown -- only two allocators are implemented.
-    addLocalChoice("algorithmType", {"FIFO", "COST"}, /*editable=*/false);
+    // algorithmType: strict dropdown -- four allocator variants are implemented.
+    //   FIFO          : insertion-order queue, idle-only dispatch, no preemption.
+    //   FIFO_PRIO     : priority-ordered queue (higher-priority tasks jump
+    //                   ahead), idle-only dispatch, no preemption.
+    //   FIFO_PREEMPT  : priority-ordered queue + may preempt drones currently
+    //                   running a STRICTLY lower-priority task when there
+    //                   aren't enough idle drones (MBS preemption stays a
+    //                   COST-only feature). Dispatch picks closest drones.
+    //   COST          : full auction, see assignTaskCost.
+    addLocalChoice("algorithmType",
+                   {"FIFO", "FIFO_PRIO", "FIFO_PREEMPT", "COST"},
+                   /*editable=*/false);
     addLocal("taskLimit");
     // taskGenerationInterval: editable dropdown with common arrival-pattern
     // presets. UNIFORM = flat between bounds; NORMAL = Gaussian around a mean
@@ -118,8 +172,37 @@ void MainNodeApp::promptUserForParameters() {
     }, /*editable=*/true);
     addLocal("taskDuration");
     addLocal("bumpDroppedPriority");
+    addLocal("priorityLevels");
+    // priorityWeights: editable dropdown of common priority-distribution
+    // presets. Empty string = uniform; otherwise one weight per class
+    // (leftmost = priority 1 = HIGH). Weights are normalised internally.
+    addLocalChoice("priorityWeights", {
+        "",                          // uniform
+        "5 2 1",                     // mostly high-pri
+        "1 2 5",                     // mostly low-pri
+        "1 3 1"                      // peaked on middle priority
+    }, /*editable=*/true);
+    // taskDeadlineWeights: per-class queue-wait deadlines in seconds.
+    // Empty string = no expiry; otherwise priorityLevels positive values
+    // (leftmost = priority 1 = HIGH, conventionally shortest).
+    addLocalChoice("taskDeadlineWeights", {
+        "",                          // no deadlines
+        "10 30 120",                 // HIGH stale fast, LOW patient
+        "30 60 180",                 // looser SLA ladder
+        "5 20 60 180 600"            // 5-level example
+    }, /*editable=*/true);
     addLocal("costEnergyWeight");
     addLocal("costHaltPriorityWeight");
+    // costHaltPriorityWeights: editable dropdown of per-class halt-weight
+    // presets. Empty string = use the scalar costHaltPriorityWeight with a
+    // linear ramp; otherwise one positive weight per priority class
+    // (leftmost = priority 1 = HIGH).
+    addLocalChoice("costHaltPriorityWeights", {
+        "",                          // linear ramp from the scalar weight
+        "300 200 100",               // explicit linear, equiv to scalar=100
+        "1000 100 10",               // steep: HIGH ~100x more protected than LOW
+        "1000 500 100 50 10"         // example 5-level table
+    }, /*editable=*/true);
     addLocal("costHaltGroupSizeWeight");
     addLocal("costMbsRelocationWeight");
     addBroadcast("drone_comm_range",    "^.^.drone", numDrones, "drone_comm_range");
@@ -131,6 +214,11 @@ void MainNodeApp::promptUserForParameters() {
     // Helper: write parsed value into primary + every broadcast target.
     // For STRING-typed params we accept unquoted user input (e.g. "FIFO"
     // from a dropdown) and re-add the quotes that cPar::parse() expects.
+    //   displayValue  -- strip the surrounding quotes for showing in the UI
+    //   toParseValue  -- inverse: re-quote (and escape) before parse()
+    //   applyValue    -- skip the parse() entirely if the user didn't
+    //                    change anything (cheap and avoids triggering the
+    //                    @mutable check for params that don't need it)
     auto displayValue = [](cPar& p) -> std::string {
         std::string s = p.str();
         if (p.getType() == cPar::STRING && s.size() >= 2 &&
@@ -284,7 +372,11 @@ void MainNodeApp::initialize(int stage) {
         }
 
         std::string algo = par("algorithmType").stringValue();
-        if (algo == "AUCTION" || algo == "COST") {
+        // Priority-ordered queue is shared by every variant that cares about
+        // priority (the two preempting allocators + the FIFO variant that
+        // only re-orders the queue without preempting).
+        if (algo == "AUCTION" || algo == "COST"
+            || algo == "FIFO_PRIO" || algo == "FIFO_PREEMPT") {
             taskQueue.setup(compareTaskPriority);
         }
 
@@ -293,6 +385,140 @@ void MainNodeApp::initialize(int stage) {
         costHaltPriorityWeight  = par("costHaltPriorityWeight").doubleValue();
         costHaltGroupSizeWeight = par("costHaltGroupSizeWeight").doubleValue();
         costMbsRelocationWeight = par("costMbsRelocationWeight").doubleValue();
+        costHaltPriorityTable.clear();   // populated below once priorityLevels is known
+
+        // ---- Task-priority distribution -----------------------------------
+        // Parse priorityLevels + priorityWeights into a CDF (or leave empty
+        // for uniform sampling). Done once at init -- the weights are static
+        // configuration, not a per-task volatile param.
+        //
+        // PARSER PATTERN: the same shape is repeated below for
+        // costHaltPriorityWeights and taskDeadlineWeights (trim ws, split
+        // on ',' or whitespace, verify count == priorityLevels, sanity-check
+        // values, store in a std::vector<double>). Kept inline (rather than
+        // factored out) so each block can throw cRuntimeError with the
+        // specific param name and so per-parameter validation rules
+        // (e.g. positivity, normalisation) live next to the data they
+        // validate. Refactor with care -- the error messages are part of
+        // the user-facing diagnostics.
+        priorityLevels = par("priorityLevels").intValue();
+        if (priorityLevels < 1) {
+            throw cRuntimeError("priorityLevels must be >= 1 (got %d)", priorityLevels);
+        }
+        priorityCdf.clear();
+        std::string weightsStr = par("priorityWeights").stringValue();
+        // Trim leading/trailing whitespace so " " is treated as empty.
+        auto isWs = [](unsigned char c) { return std::isspace(c) != 0; };
+        while (!weightsStr.empty() && isWs(weightsStr.front())) weightsStr.erase(weightsStr.begin());
+        while (!weightsStr.empty() && isWs(weightsStr.back()))  weightsStr.pop_back();
+        if (!weightsStr.empty()) {
+            // Accept commas or whitespace as separators.
+            std::vector<double> weights;
+            std::string token;
+            for (char c : weightsStr) {
+                if (c == ',' || std::isspace(static_cast<unsigned char>(c))) {
+                    if (!token.empty()) { weights.push_back(std::stod(token)); token.clear(); }
+                } else {
+                    token.push_back(c);
+                }
+            }
+            if (!token.empty()) weights.push_back(std::stod(token));
+            if ((int)weights.size() != priorityLevels) {
+                throw cRuntimeError("priorityWeights has %d entries but priorityLevels=%d "
+                                    "(expected one weight per priority class)",
+                                    (int)weights.size(), priorityLevels);
+            }
+            double sum = 0;
+            for (double w : weights) {
+                if (w < 0) throw cRuntimeError("priorityWeights contains a negative value");
+                sum += w;
+            }
+            if (sum <= 0) throw cRuntimeError("priorityWeights sum to zero");
+            priorityCdf.reserve(weights.size());
+            double acc = 0;
+            for (double w : weights) { acc += w / sum; priorityCdf.push_back(acc); }
+            priorityCdf.back() = 1.0;  // guard against float rounding
+            EV << "Task priority distribution (weighted): ";
+            double prev = 0;
+            for (size_t i = 0; i < priorityCdf.size(); ++i) {
+                EV << "p" << (i+1) << "=" << (priorityCdf[i] - prev) << " ";
+                prev = priorityCdf[i];
+            }
+            EV << "\n";
+        } else {
+            EV << "Task priority distribution: uniform over 1.." << priorityLevels << "\n";
+        }
+
+        // ---- Per-priority halt-weight table (optional override) -----------
+        // Parsed with the same separator rules as priorityWeights. When empty
+        // we leave costHaltPriorityTable empty and computeHaltPenalty falls
+        // back to the scalar * linear-ramp formula.
+        std::string haltWeightsStr = par("costHaltPriorityWeights").stringValue();
+        while (!haltWeightsStr.empty() && isWs(haltWeightsStr.front())) haltWeightsStr.erase(haltWeightsStr.begin());
+        while (!haltWeightsStr.empty() && isWs(haltWeightsStr.back()))  haltWeightsStr.pop_back();
+        if (!haltWeightsStr.empty()) {
+            std::vector<double> weights;
+            std::string token;
+            for (char c : haltWeightsStr) {
+                if (c == ',' || std::isspace(static_cast<unsigned char>(c))) {
+                    if (!token.empty()) { weights.push_back(std::stod(token)); token.clear(); }
+                } else {
+                    token.push_back(c);
+                }
+            }
+            if (!token.empty()) weights.push_back(std::stod(token));
+            if ((int)weights.size() != priorityLevels) {
+                throw cRuntimeError("costHaltPriorityWeights has %d entries but priorityLevels=%d "
+                                    "(expected one weight per priority class)",
+                                    (int)weights.size(), priorityLevels);
+            }
+            for (double w : weights) {
+                if (w < 0) throw cRuntimeError("costHaltPriorityWeights contains a negative value");
+            }
+            costHaltPriorityTable = std::move(weights);
+            EV << "Cost halt-priority table: ";
+            for (size_t i = 0; i < costHaltPriorityTable.size(); ++i)
+                EV << "p" << (i+1) << "=" << costHaltPriorityTable[i] << " ";
+            EV << "\n";
+        } else {
+            EV << "Cost halt-priority: scalar=" << costHaltPriorityWeight
+               << " with linear ramp (priorityLevels+1 - p), range "
+               << costHaltPriorityWeight << ".." << (costHaltPriorityWeight * priorityLevels) << "\n";
+        }
+
+        // ---- Per-priority queue-wait deadlines (optional) -----------------
+        // Same separator rules as the other tables. Empty => no expiry.
+        taskDeadlineTable.clear();
+        std::string deadlinesStr = par("taskDeadlineWeights").stringValue();
+        while (!deadlinesStr.empty() && isWs(deadlinesStr.front())) deadlinesStr.erase(deadlinesStr.begin());
+        while (!deadlinesStr.empty() && isWs(deadlinesStr.back()))  deadlinesStr.pop_back();
+        if (!deadlinesStr.empty()) {
+            std::vector<double> deadlines;
+            std::string token;
+            for (char c : deadlinesStr) {
+                if (c == ',' || std::isspace(static_cast<unsigned char>(c))) {
+                    if (!token.empty()) { deadlines.push_back(std::stod(token)); token.clear(); }
+                } else {
+                    token.push_back(c);
+                }
+            }
+            if (!token.empty()) deadlines.push_back(std::stod(token));
+            if ((int)deadlines.size() != priorityLevels) {
+                throw cRuntimeError("taskDeadlineWeights has %d entries but priorityLevels=%d "
+                                    "(expected one deadline per priority class)",
+                                    (int)deadlines.size(), priorityLevels);
+            }
+            for (double d : deadlines) {
+                if (d <= 0) throw cRuntimeError("taskDeadlineWeights entries must be positive (got %g)", d);
+            }
+            taskDeadlineTable = std::move(deadlines);
+            EV << "Task wait deadlines (s): ";
+            for (size_t i = 0; i < taskDeadlineTable.size(); ++i)
+                EV << "p" << (i+1) << "=" << taskDeadlineTable[i] << " ";
+            EV << "\n";
+        } else {
+            EV << "Task wait deadlines: disabled (tasks wait forever in queue)\n";
+        }
 
         generateTaskTimer = new cMessage("generateTaskTimer");
         scheduleAt(simTime() + par("taskGenerationInterval"), generateTaskTimer);
@@ -314,6 +540,15 @@ void MainNodeApp::initialize(int stage) {
 // -----------------------------------------------------------------------
 // MESSAGE HANDLING
 // -----------------------------------------------------------------------
+// All inputs are self-messages -- there are no network gates on the
+// mainNode (drone/MBS feedback comes through direct method calls). Two
+// kinds of self-messages exist:
+//   (1) generateTaskTimer -- the periodic task-arrival tick. Reschedules
+//       itself until taskLimit is reached.
+//   (2) cMessage("taskDeadline") with kind() == taskId -- per-task
+//       queue-wait expiry, scheduled in generateNewTask when
+//       taskDeadlineTable is non-empty and cancelled in dispatchUnits.
+// Anything else is dropped (kept as a guard against future stray sends).
 void MainNodeApp::handleMessage(cMessage *msg) {
     if (msg == generateTaskTimer) {
         if (taskQueue.getLength() < maxQueueSize) {
@@ -325,6 +560,13 @@ void MainNodeApp::handleMessage(cMessage *msg) {
             EV << "Task limit of " << par("taskLimit").intValue() << " reached! No more tasks.\n";
         }
     }
+    else if (msg->isSelfMessage() && strcmp(msg->getName(), "taskDeadline") == 0) {
+        // The taskId is stashed in the message kind. Drop the map entry
+        // (the handler does that) and then delete the fired message.
+        int taskId = msg->getKind();
+        onTaskDeadlineExpired(taskId);
+        delete msg;
+    }
     else {
         // No network gates anymore: anything else is unexpected.
         delete msg;
@@ -334,13 +576,29 @@ void MainNodeApp::handleMessage(cMessage *msg) {
 // -----------------------------------------------------------------------
 // TASK GENERATION & QUEUE MANAGEMENT
 // -----------------------------------------------------------------------
+int MainNodeApp::drawTaskPriority() {
+    // Uniform fast-path: nothing was configured, fall back to the original
+    // intuniform behaviour over [1..priorityLevels].
+    if (priorityCdf.empty()) {
+        return intuniform(1, priorityLevels);
+    }
+    // Weighted draw via inverse-CDF: priorityCdf[k] is the cumulative prob
+    // of pri <= (k+1). Walk left-to-right -- vectors of 3..10 entries are
+    // small enough that this is faster than binary search.
+    double u = uniform(0, 1);
+    for (size_t i = 0; i < priorityCdf.size(); ++i) {
+        if (u < priorityCdf[i]) return static_cast<int>(i) + 1;
+    }
+    return priorityLevels;  // covers the u == 1.0 boundary case
+}
+
 void MainNodeApp::generateNewTask() {
     taskCounter++;
     TaskNotification *newTask = new TaskNotification();
     newTask->setTaskId(taskCounter);
     newTask->setTargetX(uniform(0, 2000));
     newTask->setTargetY(uniform(0, 2000));
-    newTask->setPriority(intuniform(1, 3));
+    newTask->setPriority(drawTaskPriority());
     newTask->setRequiredDrones(intuniform(1, 3));
     newTask->setDuration(par("taskDuration").doubleValue());
 
@@ -362,6 +620,22 @@ void MainNodeApp::generateNewTask() {
     EV << "Generated Task #" << taskCounter << "\n";
     addTaskFigure(taskCounter, newTask->getTargetX(), newTask->getTargetY());
     taskQueue.insert(newTask);
+
+    // Schedule a per-task wait deadline if one is configured for this
+    // priority class. Cancelled in dispatchUnits when the task is served;
+    // if the timer fires first the task is yanked from the queue and
+    // finalized as EXPIRED.
+    if (!taskDeadlineTable.empty()) {
+        int p = rec.priority;
+        if (p < 1) p = 1;
+        if (p > priorityLevels) p = priorityLevels;
+        double deadline = taskDeadlineTable[p - 1];
+        cMessage *timer = new cMessage("taskDeadline");
+        timer->setKind(taskCounter);   // carry the taskId through the scheduler
+        taskDeadlineTimers[taskCounter] = timer;
+        scheduleAt(simTime() + deadline, timer);
+    }
+
     refreshStatsPanel();
     tryAssignTask();
 }
@@ -370,7 +644,8 @@ void MainNodeApp::tryAssignTask() {
     if (taskQueue.isEmpty()) return;
 
     std::string algo = par("algorithmType").stringValue();
-    if (algo == "FIFO") {
+    if (algo == "FIFO" || algo == "FIFO_PRIO" || algo == "FIFO_PREEMPT") {
+        // assignTaskFifo branches internally on the variant.
         assignTaskFifo();
     } else if (algo == "COST") {
         assignTaskCost();
@@ -378,7 +653,8 @@ void MainNodeApp::tryAssignTask() {
         // Legacy alias kept for backward compatibility with old .ini files.
         assignTaskCost();
     } else {
-        throw cRuntimeError("Unknown algorithmType '%s' (expected 'FIFO' or 'COST')",
+        throw cRuntimeError("Unknown algorithmType '%s' (expected 'FIFO', "
+                            "'FIFO_PRIO', 'FIFO_PREEMPT' or 'COST')",
                             algo.c_str());
     }
 }
@@ -481,9 +757,22 @@ void MainNodeApp::scaleRemainingDurationForTask(int taskId, int leavingDroneId, 
 }
 
 // Bookkeeping + CSV row for a task that has ended (one way or another).
+// Two outcome buckets are tracked for the HUD counter:
+//   COMPLETED                      -> tasksCompleted++
+//   DROPPED, EXPIRED (treated equivalently here -- both are failures from
+//                     the operator's point of view; the CSV preserves the
+//                     distinction so post-processing can split them).
+//   UNFINISHED / QUEUED            -> only emitted from finish() for tasks
+//                                     still in flight / still waiting when
+//                                     the sim ends; never reach finalizeTask
+//                                     during steady-state operation.
 void MainNodeApp::finalizeTask(int taskId, const std::string& outcome) {
-    if (outcome == "DROPPED") tasksDropped++;
-    else                      tasksCompleted++;
+    if (outcome == "DROPPED" || outcome == "EXPIRED") tasksDropped++;
+    else                                              tasksCompleted++;
+
+    // Defensive: deadline timer is normally already gone by now
+    // (cancelled at dispatch, or removed by the expiry handler).
+    cancelTaskDeadline(taskId);
 
     auto rit = taskRecords.find(taskId);
     if (rit != taskRecords.end()) {
@@ -498,6 +787,60 @@ void MainNodeApp::finalizeTask(int taskId, const std::string& outcome) {
     removeTaskFromMbs(taskId);
     refreshStatsPanel();
     tryAssignTask();
+}
+
+// Cancel + free a pending wait-deadline timer. Idempotent / safe to call
+// when no timer exists (e.g. when deadlines are disabled, or when the
+// timer has already fired and been deleted by handleMessage).
+void MainNodeApp::cancelTaskDeadline(int taskId) {
+    auto it = taskDeadlineTimers.find(taskId);
+    if (it == taskDeadlineTimers.end()) return;
+    cancelAndDelete(it->second);
+    taskDeadlineTimers.erase(it);
+}
+
+// Called from handleMessage when a task's deadline timer fires.
+// Walks the queue, pulls the matching TaskNotification out (if still
+// there), and finalizes it as EXPIRED. No-op if the task was dispatched
+// or already finalized through some other path between the timer firing
+// and this handler running (shouldn't happen in practice because dispatch
+// cancels the timer, but defensive).
+void MainNodeApp::onTaskDeadlineExpired(int taskId) {
+    // Drop the map entry first so subsequent cancelTaskDeadline() calls
+    // (e.g. from finalizeTask) become no-ops -- the message itself is
+    // owned by handleMessage now and will be deleted there.
+    taskDeadlineTimers.erase(taskId);
+
+    auto rit = taskRecords.find(taskId);
+    if (rit == taskRecords.end()) {
+        EV_WARN << "Deadline fired for unknown Task #" << taskId << " (already finalized?)\n";
+        return;
+    }
+    if (rit->second.dispatchedAt >= SIMTIME_ZERO) {
+        // Race: dispatched between timer firing and this handler.
+        EV_WARN << "Deadline fired for Task #" << taskId
+                << " but it was already dispatched; ignoring.\n";
+        return;
+    }
+
+    // Find and remove the TaskNotification from the queue.
+    TaskNotification *found = nullptr;
+    for (cQueue::Iterator it(taskQueue); !it.end(); ++it) {
+        TaskNotification *t = check_and_cast<TaskNotification *>(*it);
+        if (t->getTaskId() == taskId) { found = t; break; }
+    }
+    if (found != nullptr) {
+        taskQueue.remove(found);
+        EV << "Task #" << taskId << " EXPIRED in queue (priority "
+           << found->getPriority() << ", waited "
+           << (simTime() - rit->second.generatedAt) << "s)\n";
+        delete found;
+    } else {
+        EV_WARN << "Deadline fired for Task #" << taskId
+                << " but it was not in the queue.\n";
+    }
+
+    finalizeTask(taskId, "EXPIRED");
 }
 
 // Bookkeeping for a single COST-allocator preemption.
@@ -529,17 +872,32 @@ void MainNodeApp::handlePreemption(int oldTaskId, int leavingDroneId, int newTas
 }
 
 // -----------------------------------------------------------------------
-// FIFO ASSIGNMENT
+// FIFO ASSIGNMENT (covers FIFO, FIFO_PRIO and FIFO_PREEMPT)
 // -----------------------------------------------------------------------
+// The three FIFO variants share this dispatcher and differ in two axes:
+//   * queue ordering (FIFO insertion vs priority comparator), wired up
+//     once in initialize() based on algorithmType -- nothing to do here.
+//   * drone picking: plain FIFO/FIFO_PRIO only accept idle drones; the
+//     FIFO_PREEMPT variant additionally interrupts drones currently on
+//     a STRICTLY lower-priority task to fill the team. MBS preemption is
+//     intentionally NOT enabled for any FIFO variant -- that's the COST
+//     allocator's exclusive feature.
 void MainNodeApp::assignTaskFifo() {
     TaskNotification *task = check_and_cast<TaskNotification *>(taskQueue.front());
     double targetX = task->getTargetX();
     double targetY = task->getTargetY();
     int reqDrones = task->getRequiredDrones();
-    EV << "Trying to assign " << reqDrones << " drones to task " << task->getTaskId()
-       << " at position (" << targetX << "," << targetY << ")\n";
+    int priority  = task->getPriority();
+    std::string algo = par("algorithmType").stringValue();
+    bool allowPreempt = (algo == "FIFO_PREEMPT");
 
-    std::vector<cModule*> assignedDrones = findClosestIdleDrones(targetX, targetY, reqDrones);
+    EV << "FIFO[" << algo << "] trying to assign " << reqDrones
+       << " drones to task " << task->getTaskId()
+       << " (prio=" << priority << ") at (" << targetX << "," << targetY << ")\n";
+
+    std::vector<cModule*> assignedDrones = allowPreempt
+        ? findClosestDronesWithPreempt(targetX, targetY, reqDrones, priority)
+        : findClosestIdleDrones(targetX, targetY, reqDrones);
     if ((int)assignedDrones.size() < reqDrones) {
         EV << "Couldn't find enough drones to assign to task: " << task->getTaskId() << "\n";
         return;
@@ -553,7 +911,14 @@ void MainNodeApp::assignTaskFifo() {
     }
 
     taskQueue.pop();
-    dispatchUnits(task, assignedDrones, assignedMbs, centroidX, centroidY);
+    // preemptAndDispatchUnits is a no-op on the preempt side when every
+    // selected drone is idle, so it's safe to use unconditionally for the
+    // preempting variant; the plain FIFO path keeps the lighter dispatchUnits.
+    if (allowPreempt) {
+        preemptAndDispatchUnits(task, assignedDrones, assignedMbs, centroidX, centroidY);
+    } else {
+        dispatchUnits(task, assignedDrones, assignedMbs, centroidX, centroidY);
+    }
 
     delete task;
     tryAssignTask();
@@ -578,11 +943,29 @@ void MainNodeApp::assignTaskFifo() {
 
 double MainNodeApp::computeHaltPenalty(int currentPriority, int currentGroupSize) {
     // halt(t) -- the punishment for abandoning the task currently being run.
-    // Higher-priority (lower-numbered) tasks are MORE painful to halt, so the
-    // priority term is (4 - p): priority 1 -> 3x weight, priority 3 -> 1x.
-    // The group-size term scales with how many drones we'd be disrupting.
-    return costHaltPriorityWeight * (4 - currentPriority)
-         + costHaltGroupSizeWeight * currentGroupSize;
+    // Higher-priority (lower-numbered) tasks are MORE painful to halt.
+    //
+    // Two sources of the per-priority weight:
+    //   * costHaltPriorityTable (set via costHaltPriorityWeights) is used
+    //     verbatim when non-empty -- entry (p-1) is the weight for priority p.
+    //   * Otherwise we fall back to costHaltPriorityWeight scaled by a linear
+    //     ramp (priorityLevels + 1 - p), so priority 1 (HIGH) gets the largest
+    //     weight and priority priorityLevels (LOW) gets weight 1. This
+    //     generalises the original (4 - p) formula to any priorityLevels.
+    //
+    // currentPriority is clamped into [1, priorityLevels]: sentinel values
+    // (e.g. 99 when the task record is missing) are treated as LOW.
+    int p = currentPriority;
+    if (p < 1) p = 1;
+    if (p > priorityLevels) p = priorityLevels;
+
+    double prioWeight;
+    if (!costHaltPriorityTable.empty()) {
+        prioWeight = costHaltPriorityTable[p - 1];
+    } else {
+        prioWeight = costHaltPriorityWeight * (priorityLevels + 1 - p);
+    }
+    return prioWeight + costHaltGroupSizeWeight * currentGroupSize;
 }
 
 double MainNodeApp::computeDroneCost(cModule* droneMod, double targetX, double targetY, int newTaskPriority) {
@@ -855,6 +1238,9 @@ void MainNodeApp::assignTaskCost() {
 }
 
 std::vector<cModule*> MainNodeApp::findClosestIdleDrones(double targetX, double targetY, int reqDrones) {
+    // Plain FIFO / FIFO_PRIO drone picker: scan every drone, keep the IDLE
+    // ones, sort by Euclidean distance to the task, return the closest N.
+    // Busy drones are ignored entirely -- no preemption in these variants.
     std::vector<std::pair<double, cModule*>> idleDrones;
     int totalDrones = getParentModule()->getParentModule()->par("numDrones").intValue();
 
@@ -878,7 +1264,78 @@ std::vector<cModule*> MainNodeApp::findClosestIdleDrones(double targetX, double 
     return selectedDrones;
 }
 
+// FIFO_PREEMPT picker -- "closest idle drones first, then top up with the
+// closest drones currently on a STRICTLY lower-priority task." We always
+// prefer idle, even if a busy lower-priority drone happens to be closer:
+// the goal is to avoid the disruption cost of a preemption when an idle
+// alternative exists. (COST's auction is the place to make that tradeoff
+// quantitatively; FIFO_PREEMPT's rule is intentionally simpler.)
+std::vector<cModule*> MainNodeApp::findClosestDronesWithPreempt(
+        double targetX, double targetY, int reqDrones, int newPriority) {
+    int totalDrones = getParentModule()->getParentModule()->par("numDrones").intValue();
+
+    std::vector<std::pair<double, cModule*>> idle;
+    std::vector<std::pair<double, cModule*>> preemptible;
+
+    for (int i = 0; i < totalDrones; i++) {
+        cModule *droneMod = getModuleByPath(("^.^.drone[" + std::to_string(i) + "].app[0]").c_str());
+        auto droneApp = check_and_cast<uavswarmta::DroneApp *>(droneMod);
+        auto dMob = check_and_cast<inet::IMobility *>(
+            droneMod->getParentModule()->getSubmodule("mobility"));
+        double dist = dMob->getCurrentPosition().distance(
+            inet::Coord(targetX, targetY, 0));
+
+        if (droneApp->isIdle()) {
+            idle.push_back({dist, droneMod});
+            continue;
+        }
+        int curTaskId = droneApp->getCurrentTaskId();
+        auto rit = taskRecords.find(curTaskId);
+        if (rit == taskRecords.end()) continue;             // shouldn't happen
+        int curPrio = rit->second.priority;
+        if (curPrio > newPriority) {                        // strictly lower urgency
+            preemptible.push_back({dist, droneMod});
+        }
+    }
+
+    std::sort(idle.begin(),        idle.end());
+    std::sort(preemptible.begin(), preemptible.end());
+
+    std::vector<cModule*> selected;
+    selected.reserve(reqDrones);
+    for (auto& p : idle) {
+        if ((int)selected.size() >= reqDrones) break;
+        selected.push_back(p.second);
+    }
+    for (auto& p : preemptible) {
+        if ((int)selected.size() >= reqDrones) break;
+        selected.push_back(p.second);
+    }
+
+    if ((int)selected.size() < reqDrones) {
+        EV << "FIFO_PREEMPT: only " << selected.size()
+           << "/" << reqDrones << " drones available (idle=" << idle.size()
+           << ", preemptible=" << preemptible.size()
+           << ", newPriority=" << newPriority << ")\n";
+    } else {
+        int nIdle = std::min((int)idle.size(), reqDrones);
+        int nPreempt = (int)selected.size() - nIdle;
+        if (nPreempt > 0) {
+            EV << "FIFO_PREEMPT: picked " << nIdle << " idle + "
+               << nPreempt << " preempted drones for prio=" << newPriority << "\n";
+        }
+    }
+    return selected;
+}
+
 cModule* MainNodeApp::findSuitableMbs(double targetX, double targetY, double& outCentroidX, double& outCentroidY) {
+    // FIFO-side MBS picker. Two-attempt strategy:
+    //   A) prefer EXTENDING an already-active MBS so the new task and its
+    //      existing tasks all stay within range of a recomputed centroid.
+    //      No drops, no movement waste.
+    //   B) fall back to the closest IDLE MBS, centred on the new task.
+    // (The COST allocator uses findCostMinimalMbs instead, which considers
+    // all options uniformly and may RELOCATE-AND-DROP lower-priority tasks.)
     int totalMbs = getParentModule()->getParentModule()->par("numMbs").intValue();
     inet::Coord newTaskPos(targetX, targetY, 0);
 
@@ -950,6 +1407,18 @@ cModule* MainNodeApp::findSuitableMbs(double targetX, double targetY, double& ou
 }
 
 void MainNodeApp::dispatchUnits(TaskNotification* task, std::vector<cModule*>& drones, cModule* mbs, double centroidX, double centroidY) {
+    // Common dispatch tail used by every allocator (FIFO variants directly,
+    // COST via preemptAndDispatchUnits). Responsibilities:
+    //   1. Record activeTask* state so subsequent allocator rounds know
+    //      the drones/MBSs are busy.
+    //   2. Stamp dispatchedAt + dronesAssigned on the TaskRecord (used by
+    //      CSV waitTime, and by the deadline-expiry race guard).
+    //   3. Cancel the queue-wait deadline timer -- once in flight, the
+    //      task is no longer subject to taskDeadlineWeights.
+    //   4. Compute a shared "sync wait" = max travel time across all
+    //      participants, so drones don't start before the MBS arrives.
+    //   5. Issue the orders (mbsApp->assignInitialTask / addCoveredTask,
+    //      droneApp->assignTask) and flip the figure colour.
     int taskId = task->getTaskId();
     double targetX = task->getTargetX();
     double targetY = task->getTargetY();
@@ -964,6 +1433,9 @@ void MainNodeApp::dispatchUnits(TaskNotification* task, std::vector<cModule*>& d
         rit->second.dispatchedAt = simTime();
         rit->second.dronesAssigned = (int)drones.size();
     }
+
+    // The task is now in flight -- the queue-wait deadline no longer applies.
+    cancelTaskDeadline(taskId);
 
     double maxTravelTime = 0.0;
 
@@ -1113,6 +1585,20 @@ void MainNodeApp::refreshStatsPanel() {
 // -----------------------------------------------------------------------
 // CSV per-task logging
 // -----------------------------------------------------------------------
+// One row per finalized task. The `outcome` column takes one of:
+//   COMPLETED  -- every assigned drone successfully completed its share
+//   DROPPED    -- task aborted in flight (last drone bailed, COST chose
+//                 to sacrifice for a higher-priority task, or MBS
+//                 RELOCATE-AND-DROP picked it as collateral)
+//   EXPIRED    -- queue-wait deadline (taskDeadlineWeights) fired before
+//                 dispatch; the task never left the queue
+//   UNFINISHED -- emitted in finish() for tasks still in flight at
+//                 sim-time-limit (dispatched but not completed)
+//   QUEUED     -- emitted in finish() for tasks that were generated but
+//                 never dispatched (only possible when deadlines are off)
+// The plotter at sweep_plotter.py groups everything that isn't COMPLETED
+// as a drop (drop_rate), and additionally exposes expired_rate and
+// preempt_drop_rate to distinguish SLA misses from preemption losses.
 void MainNodeApp::openCsv() {
     // Path comes from the NED/ini param `csvOutputPath`. Supported
     // placeholders (expanded once, here at sim start):

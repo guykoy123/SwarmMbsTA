@@ -62,6 +62,25 @@ class MainNodeApp : public cSimpleModule {
     double costHaltPriorityWeight = 100.0;
     double costHaltGroupSizeWeight = 10.0;
     double costMbsRelocationWeight = 1.0;
+    // Per-priority halt-weight table. Empty => use the linear scalar
+    // fallback (costHaltPriorityWeight * (priorityLevels + 1 - p)).
+    // When non-empty, size() == priorityLevels and the entry at
+    // index (p - 1) is the absolute halt weight for priority p.
+    std::vector<double> costHaltPriorityTable;
+
+    // Task-priority distribution (parsed from NED params at init).
+    // priorityCdf is empty => fall back to intuniform(1, priorityLevels).
+    // Otherwise priorityCdf[k] holds the cumulative probability of drawing
+    // priority <= (k+1); the last entry is always 1.0.
+    int priorityLevels = 3;
+    std::vector<double> priorityCdf;
+
+    // Per-priority queue-wait deadlines (in seconds). Empty => no expiry.
+    // Entry (p-1) is the maximum time a priority-p task may sit in the
+    // queue before being dropped with outcome "EXPIRED". Cancelled the
+    // moment the task is dispatched.
+    std::vector<double> taskDeadlineTable;
+    std::map<int, cMessage*> taskDeadlineTimers;
 
     // ---- stats for the HUD ----
     int tasksCompleted = 0;
@@ -84,7 +103,22 @@ class MainNodeApp : public cSimpleModule {
     virtual void tryAssignTask();
     virtual void assignTaskFifo();
     virtual void assignTaskCost();
+    // Draw a task priority in [1..priorityLevels] using the cached CDF
+    // (or intuniform() when priorityWeights is empty).
+    virtual int drawTaskPriority();
+    // Called when a queued task's wait-deadline timer fires. Removes the
+    // task from the queue and finalizes it as EXPIRED. No-op if the task
+    // has already been dispatched (timer should have been cancelled).
+    virtual void onTaskDeadlineExpired(int taskId);
+    // Cancel + delete a pending deadline timer (called at dispatch and as
+    // a defensive cleanup in finalizeTask). Safe to call when no timer
+    // exists for the given taskId.
+    virtual void cancelTaskDeadline(int taskId);
     virtual std::vector<cModule*> findClosestIdleDrones(double targetX, double targetY, int reqDrones);
+    // FIFO_PREEMPT helper: take closest idle drones first, then top up with the
+    // closest drones currently on a STRICTLY lower-priority task. Returns fewer
+    // than reqDrones if even the preemptible pool is too small.
+    virtual std::vector<cModule*> findClosestDronesWithPreempt(double targetX, double targetY, int reqDrones, int newPriority);
     virtual cModule* findSuitableMbs(double targetX, double targetY, double& outCentroidX, double& outCentroidY);
     virtual void dispatchUnits(TaskNotification* task, std::vector<cModule*>& drones, cModule* mbs, double centroidX, double centroidY);
 
