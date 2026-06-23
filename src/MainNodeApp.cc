@@ -348,7 +348,12 @@ void MainNodeApp::promptUserForParameters() {
 void MainNodeApp::initialize(int stage) {
     if (stage == 0) {
         taskCounter = 0;
-        maxQueueSize = 50;
+        // The pending-task queue can never need to hold more entries than
+        // the total number of tasks the generator will ever produce, so we
+        // simply mirror taskLimit. This removes a previously-hardcoded
+        // backpressure cap (50) that could silently throttle generation
+        // when running with severe drone shortages + long deadlines.
+        maxQueueSize = par("taskLimit").intValue();
         commRange = 1e9;  // mainNode is "god mode"; no link is range-limited
 
         // Hide the mainNode submodule from Qtenv. MobileHost inherits an
@@ -762,10 +767,13 @@ void MainNodeApp::scaleRemainingDurationForTask(int taskId, int leavingDroneId, 
 //   DROPPED, EXPIRED (treated equivalently here -- both are failures from
 //                     the operator's point of view; the CSV preserves the
 //                     distinction so post-processing can split them).
-//   UNFINISHED / QUEUED            -> only emitted from finish() for tasks
-//                                     still in flight / still waiting when
-//                                     the sim ends; never reach finalizeTask
-//                                     during steady-state operation.
+//   UNFINISHED                     -> only emitted from finish() for tasks
+//                                     still in flight when the sim ends;
+//                                     never reaches finalizeTask during
+//                                     steady-state operation. (Tasks still
+//                                     waiting in the queue at sim end are
+//                                     emitted as EXPIRED -- they were never
+//                                     serviced within the available time.)
 void MainNodeApp::finalizeTask(int taskId, const std::string& outcome) {
     if (outcome == "DROPPED" || outcome == "EXPIRED") tasksDropped++;
     else                                              tasksCompleted++;
@@ -1591,11 +1599,11 @@ void MainNodeApp::refreshStatsPanel() {
 //                 to sacrifice for a higher-priority task, or MBS
 //                 RELOCATE-AND-DROP picked it as collateral)
 //   EXPIRED    -- queue-wait deadline (taskDeadlineWeights) fired before
-//                 dispatch; the task never left the queue
+//                 dispatch; OR the task was still waiting in the queue
+//                 when the sim ended (never dispatched within the
+//                 available time)
 //   UNFINISHED -- emitted in finish() for tasks still in flight at
 //                 sim-time-limit (dispatched but not completed)
-//   QUEUED     -- emitted in finish() for tasks that were generated but
-//                 never dispatched (only possible when deadlines are off)
 // The plotter at sweep_plotter.py groups everything that isn't COMPLETED
 // as a drop (drop_rate), and additionally exposes expired_rate and
 // preempt_drop_rate to distinguish SLA misses from preemption losses.
@@ -1688,9 +1696,13 @@ void MainNodeApp::writeCsvRow(const TaskRecord& r, const std::string& outcome) {
 void MainNodeApp::finish() {
     // Emit a row for any task that was still in-flight when the sim ended,
     // so the CSV gives a complete picture of every generated task.
+    // - Dispatched-but-not-completed tasks -> UNFINISHED.
+    // - Never-dispatched tasks still sitting in the queue -> EXPIRED:
+    //   from the operator's point of view the sim ran out of time before
+    //   they could be serviced, which is exactly the SLA-miss semantics.
     for (auto& kv : taskRecords) {
         std::string outcome = (kv.second.dispatchedAt >= SIMTIME_ZERO)
-                                ? "UNFINISHED" : "QUEUED";
+                                ? "UNFINISHED" : "EXPIRED";
         writeCsvRow(kv.second, outcome);
     }
     taskRecords.clear();
