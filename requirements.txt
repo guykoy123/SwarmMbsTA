@@ -1,0 +1,23 @@
+# Python dependencies for the sweep runner / plotter and the example
+# notebooks. `sweep_runner.py` itself only needs the standard library --
+# numpy/pandas/matplotlib are imported by `sweep_plotter.py`, and the
+# Jupyter + ipympl stack is only required when running the notebooks
+# with interactive widgets (`%matplotlib widget`).
+#
+# Lower bounds are conservative; the project is developed and tested
+# against the latest releases on PyPI.
+
+# --- core analysis stack (sweep_plotter.py) --------------------------------
+numpy>=1.24
+pandas>=2.0
+matplotlib>=3.7
+
+# --- notebook UX (sim_test.ipynb / algo_research.ipynb) --------------------
+# Needed for `%matplotlib widget` so the 3-D scatter plots are rotatable.
+# Drop these two if you only ever use the static inline backend.
+ipympl>=0.9
+ipywidgets>=8.0
+
+# --- jupyter kernel --------------------------------------------------------
+# Pull these in if you don't already have a jupyter install on the host.
+ipykernel>=6.0

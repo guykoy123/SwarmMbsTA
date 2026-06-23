@@ -11,3 +11,4 @@
 !*.py
 !*.ipynb
 !*.sh
+!requirements.txt
