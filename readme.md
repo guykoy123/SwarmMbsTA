@@ -44,6 +44,21 @@ Open an interactive shell once with:
 opp_env shell omnetpp-6.3.0 inet-4.5.4
 ```
 
+### Python dependencies (sweeps + plots)
+
+The sweep driver itself is stdlib-only; the plotter and notebooks need
+numpy / pandas / matplotlib and (for the rotatable 3-D plots) `ipympl`.
+The pinned set lives in [requirements.txt](requirements.txt):
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+The Jupyter kernel does **not** need to be launched from inside
+`opp_env shell` -- `setup_environment()` captures and injects the right
+env vars on first call (see §4).
+
 ---
 
 ## 2. Building
@@ -300,28 +315,33 @@ fig, df = plot_sweep("sim_data/drones_x_mbs", metric="completion_rate",
 Layout is picked automatically from the sweep's dimensionality, and the
 `kind` argument selects the visual style:
 
-| Sweep dims | `kind="box"` (default) | `kind="line"` |
-|---|---|---|
-| 2 | Side-by-side grouped box plots, one panel per algorithm; x = dim1, hue = dim2, box = distribution across reps. Shared y-axis. | One panel per value of dim2; x = dim1; one line per algorithm (mean across reps, shaded ±std band). All algorithms overlaid in the same axes. Shared y-axis. |
-| 3 | Heatmap grid: rows = algorithm, cols = values of dim3. Each cell colour = mean metric over reps; shared colour scale. | Panel grid (rows = dim2, cols = dim3) of mean ± std line plots; x = dim1; one line per algorithm. Shared y-axis. |
+| Sweep dims | `kind="box"` (default) | `kind="line"` | `kind="scatter3d"` |
+|---|---|---|---|
+| 2 | Side-by-side grouped box plots, one panel per algorithm; x = dim1, hue = dim2, box = distribution across reps. Shared y-axis. | One panel per value of dim2; x = dim1; one line per algorithm (mean across reps, shaded ±std band). All algorithms overlaid in the same axes. Shared y-axis. | Single 3-D axes with all algorithms overlaid: x = dim1, y = dim2, **z = mean(metric)**; one colour per algorithm with a wireframe + scatter so the surface shape is readable. |
+| 3 | Heatmap grid: rows = algorithm, cols = values of dim3. Each cell colour = mean metric over reps; shared colour scale. | Panel grid (rows = dim2, cols = dim3) of mean ± std line plots; x = dim1; one line per algorithm. Shared y-axis. | One 3-D axes per algorithm; x = dim1, y = dim2, z = dim3; metric encoded as point colour (shared colour bar). |
 
-Use `kind="box"` when you care about the per-rep spread / outliers, and
+Use `kind="box"` when you care about the per-rep spread / outliers,
 `kind="line"` when you want a direct algorithm-vs-algorithm overlay (the
-boxes can crowd each other once you have 4 algorithms).
+boxes can crowd each other once you have 4 algorithms), and
+`kind="scatter3d"` when the relationship between the sweep dimensions
+themselves matters (e.g. to spot a sweet spot in the `numDrones × numMbs`
+plane). The 3-D view is most useful with `%matplotlib widget`
+(`ipympl`) so you can rotate it.
 
 Available metrics (computed per repetition):
 
 | Metric | Definition | Direction |
 |---|---|---|
 | `completion_rate` | fraction of generated tasks with `outcome == COMPLETED` | higher = better |
-| `drop_rate` | fraction NOT completed (`DROPPED` from preemption / drone failure, `EXPIRED` from a missed wait deadline, or `QUEUED` / `UNFINISHED` leftovers at sim end) | lower = better |
-| `expired_rate` | fraction with `outcome == EXPIRED` — tasks that missed their per-priority queue-wait deadline. Zero when `taskDeadlineWeights` is empty | lower = better |
-| `preempt_drop_rate` | fraction with `outcome == DROPPED` — preemption, MBS relocation, drone failure, etc. (everything that isn't a deadline miss). `drop_rate = expired_rate + preempt_drop_rate + (any QUEUED / UNFINISHED leftovers)` | lower = better |
+| `drop_rate` | fraction NOT completed (`DROPPED` from preemption / drone failure, `EXPIRED` from a missed wait deadline **or** from being left in the queue when the sim ended, or `UNFINISHED` in-flight leftovers at sim end) | lower = better |
+| `expired_rate` | fraction with `outcome == EXPIRED` -- queue-wait SLA misses **plus** tasks still waiting in the queue at sim end ("never serviced in the available time"). Zero only when `taskDeadlineWeights` is empty *and* the sim drained the queue | lower = better |
+| `preempt_drop_rate` | fraction with `outcome == DROPPED` -- preemption, MBS relocation, drone failure, etc. (everything that isn't a deadline/sim-end miss). `drop_rate ≈ expired_rate + preempt_drop_rate + (any UNFINISHED leftovers)` | lower = better |
 | `mean_wait` | mean `waitTime` (dispatch − generation) over dispatched tasks | lower = better |
 | `mean_turnaround` | mean `turnaroundTime` (finalize − generation) over completed tasks | lower = better |
 | `total_drops` | sum of `dropEvents` across all tasks | lower = better |
 | `n_tasks` | total tasks generated in the run | informational |
-| `throughput` | `n_completed / sim_duration` (tasks/sec); `sim_duration` is taken as the max `finalizedAt` in the CSV — a tight lower bound on sim end | higher = better |
+| `throughput` | `n_completed / sim_duration` (tasks/sec); `sim_duration` is taken as the max `finalizedAt` in the CSV -- a tight lower bound on sim end | higher = better |
+| `sim_finish_time` | max `finalizedAt` in the CSV (seconds) -- wall-clock simulation end. Use this to compare which allocator drains the workload fastest overall | lower = better |
 
 `save="path/to/plot.png"` writes the figure (extension picks the format).
 For "lower is better" metrics the heatmap uses an inverted colour map and
@@ -367,6 +387,25 @@ up before being preempted). The pooled view is a compact summary suitable
 for a single comparison snapshot. For a fully tidy DataFrame stratified
 by priority (e.g. for custom plots) use `load_sweep_by_priority(sweep_dir)`.
 
+#### Normalised priority metrics
+
+`plot_by_priority` additionally accepts three metrics that are only
+meaningful per priority class. They normalise the raw timing/throughput
+numbers against the per-priority **budget** read from the sweep
+manifest (the `taskDeadlineWeights` and `taskDuration` you set on the
+sweep), so priorities with very different SLAs / arrival rates can be
+read on the same 0..1 scale:
+
+| Metric | Definition | Direction |
+|---|---|---|
+| `mean_wait_norm` | `mean_wait / deadline_for_priority` -- fraction of the queue-wait SLA the average dispatched task burned through. 1.0 means tasks routinely sat for their entire deadline before being picked up | lower = better |
+| `mean_turnaround_norm` | `mean_turnaround / (deadline + taskDuration)` -- fraction of the maximum-possible end-to-end time budget used by completed tasks. Can exceed 1.0 when survivors absorb extra duration after a teammate bails | lower = better |
+| `throughput_norm` | `n_completed_in_class / n_generated_in_class` -- service ratio per class (1.0 = every generated task in that class completed). Equivalent to `completion_rate` per class, but exposed as a "throughput" view that's directly comparable across priorities regardless of class arrival rate | higher = better |
+
+Missing `taskDeadlineWeights` => the wait/turnaround normalised columns
+come out as `NaN`. Missing `taskDuration` falls back to dividing the
+turnaround by just the deadline.
+
 ---
 
 ## 6. Key files
@@ -383,7 +422,9 @@ by priority (e.g. for custom plots) use `load_sweep_by_priority(sweep_dir)`.
 | [launch-omnetpp.sh](launch-omnetpp.sh) | Wrapper that starts the IDE in the opp_env environment |
 | [sweep_runner.py](sweep_runner.py) | Batch sweep driver (library + CLI) |
 | [sweep_plotter.py](sweep_plotter.py) | Load sweep outputs + render FIFO-vs-COST comparison plots |
+| [requirements.txt](requirements.txt) | Python dependencies for the sweep plotter and the notebooks |
 | [sim_test.ipynb](sim_test.ipynb) | Notebook example for sweeps + plots |
+| [algo_research.ipynb](algo_research.ipynb) | Worked research-style comparison of the four allocators on a base scenario |
 | `sim_data/`     | Sweep outputs (CSVs + logs + manifests), one folder per sweep |
 | `src/results/`  | Single-run CSVs from interactive runs |
 | `simulations/results/` | OMNeT++ scalar/vector recordings |
