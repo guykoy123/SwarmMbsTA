@@ -20,9 +20,10 @@ The per-run metrics are derived from MainNodeApp's CSV columns
     n_tasks          total tasks generated in that run
     completion_rate  fraction with outcome == COMPLETED          (higher=better)
     drop_rate            fraction NOT completed -- DROPPED + EXPIRED +
-                         never-finalized QUEUED/UNFINISHED leftovers  (lower=better)
-    expired_rate         fraction with outcome == EXPIRED  -- queue-wait SLA misses
-                         (only non-zero when taskDeadlineWeights is set)  (lower=better)
+                         never-finalized UNFINISHED leftovers          (lower=better)
+    expired_rate         fraction with outcome == EXPIRED  -- queue-wait SLA
+                         misses plus tasks still waiting in the queue at
+                         sim end (both mean "never serviced in time")   (lower=better)
     preempt_drop_rate    fraction with outcome == DROPPED  -- preemption, MBS
                          relocation, drone failure, etc. (everything that
                          isn't a deadline miss)                          (lower=better)
@@ -30,6 +31,9 @@ The per-run metrics are derived from MainNodeApp's CSV columns
     mean_turnaround  mean turnaroundTime among COMPLETED tasks    (lower=better)
     total_drops      sum of dropEvents across all generated tasks (lower=better)
     throughput       n_completed / sim_duration (tasks/sec)       (higher=better)
+    sim_finish_time  wall-clock sim end (max finalizedAt, seconds) (lower=better)
+                     -- useful to compare which algorithm drains the
+                     workload fastest overall
 
 For priority-aware analysis use `plot_by_priority` -- it stratifies by
 the per-task `priority` column (1..3 in the current generator) and plots
@@ -70,6 +74,9 @@ _LOWER_IS_BETTER = {
     "mean_wait",
     "mean_turnaround",
     "total_drops",
+    "sim_finish_time",
+    "mean_wait_norm",
+    "mean_turnaround_norm",
 }
 
 _VALID_METRICS = (
@@ -82,6 +89,17 @@ _VALID_METRICS = (
     "total_drops",
     "n_tasks",
     "throughput",
+    "sim_finish_time",
+)
+
+# Metrics that only make sense on the per-priority view (they depend on
+# the per-priority queue-wait deadline / nominal task duration, which are
+# read from the sweep manifest, not from the per-task CSV). Accepted by
+# `plot_by_priority` but not by `plot_sweep`.
+_VALID_PRIORITY_ONLY_METRICS = (
+    "mean_wait_norm",        # mean_wait / deadline_for_priority
+    "mean_turnaround_norm",  # mean_turnaround / (deadline + taskDuration)
+    "throughput_norm",       # n_completed_in_class / n_generated_in_class
 )
 
 
@@ -103,11 +121,13 @@ def _per_run_metrics(csv_path: Path) -> Dict[str, float]:
             "mean_turnaround":   float("nan"),
             "total_drops":       0,
             "throughput":        float("nan"),
+            "sim_finish_time":   float("nan"),
         }
     completed = df["outcome"] == "COMPLETED"
     # Anything that didn't COMPLETE counts as a drop (DROPPED from
     # preemption / MBS-relocation / drone failure, EXPIRED from a missed
-    # wait deadline, or never-finalized QUEUED/UNFINISHED leftovers).
+    # wait deadline or from being left in the queue at sim end, or
+    # never-finalized UNFINISHED leftovers).
     dropped       = ~completed
     # Split the not-completed pool into the two drop *causes* so the user
     # can see whether COST is leaking tasks via preemption or via SLA
@@ -116,8 +136,9 @@ def _per_run_metrics(csv_path: Path) -> Dict[str, float]:
     preempt_drop  = df["outcome"] == "DROPPED"
     dispatched = df["waitTime"] >= 0    # waitTime == -1 means never dispatched
     # sim_duration estimate: the latest `finalizedAt` is the sim end (rows
-    # for UNFINISHED/QUEUED tasks are written at finish() with now=simEnd),
-    # or the actual completion time of the last completed task otherwise.
+    # for UNFINISHED/EXPIRED-at-end tasks are written at finish() with
+    # now=simEnd), or the actual completion time of the last completed
+    # task otherwise.
     sim_duration = float(df["finalizedAt"].max())
     n_completed = int(completed.sum())
     return {
@@ -133,6 +154,7 @@ def _per_run_metrics(csv_path: Path) -> Dict[str, float]:
         "total_drops":       int(df["dropEvents"].sum()),
         "throughput":        (n_completed / sim_duration
                               if sim_duration > 0 else float("nan")),
+        "sim_finish_time":   sim_duration,
     }
 
 
@@ -240,6 +262,84 @@ def load_sweep(sweep_dir: str | Path) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Priority-aware loader
 # ---------------------------------------------------------------------------
+def _parse_omnet_seconds(value: Any) -> Optional[float]:
+    """Convert an OMNeT++ time literal (``"30s"``, ``"1.5min"``, plain
+    number) into seconds. Returns None if the value can't be parsed."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip().strip('"').strip("'").lower()
+    if not s:
+        return None
+    units = (
+        ("ms",  1e-3),
+        ("us",  1e-6),
+        ("ns",  1e-9),
+        ("min", 60.0),
+        ("h",   3600.0),
+        ("s",   1.0),
+    )
+    for suffix, mult in units:
+        if s.endswith(suffix):
+            try:
+                return float(s[: -len(suffix)]) * mult
+            except ValueError:
+                return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _parse_weight_list(value: Any) -> List[float]:
+    """Parse an OMNeT++ weight-list string (``'"30 120 300"'`` or
+    ``'30, 120, 300'``) into a list of floats. Empty / missing returns []."""
+    if value is None:
+        return []
+    s = str(value).strip().strip('"').strip("'")
+    if not s:
+        return []
+    parts = [p for p in s.replace(",", " ").split() if p]
+    out: List[float] = []
+    for p in parts:
+        try:
+            out.append(float(p))
+        except ValueError:
+            return []
+    return out
+
+
+def _read_priority_budgets(
+    sweep_dir: Path,
+) -> Tuple[Dict[int, float], Optional[float]]:
+    """Return (deadline_by_priority, task_duration_seconds).
+
+    Reads `combined_manifest.json` (or the first algorithm's
+    `sweep_manifest.json` as a fallback) and extracts the per-priority
+    queue-wait deadlines (`taskDeadlineWeights`) and the nominal task
+    execution time (`taskDuration`). Either may be empty: callers should
+    treat missing entries as "no normalisation possible" (NaN).
+    """
+    combined = sweep_dir / "combined_manifest.json"
+    if combined.is_file():
+        meta = json.loads(combined.read_text())
+    else:
+        candidates = sorted(
+            p for p in sweep_dir.iterdir()
+            if p.is_dir() and (p / "sweep_manifest.json").is_file()
+        )
+        if not candidates:
+            return ({}, None)
+        meta = json.loads((candidates[0] / "sweep_manifest.json").read_text())
+    overrides = (meta.get("extra_overrides") or {})
+
+    deadlines_raw = _parse_weight_list(overrides.get("taskDeadlineWeights"))
+    deadlines = {i + 1: v for i, v in enumerate(deadlines_raw)}
+    task_duration = _parse_omnet_seconds(overrides.get("taskDuration"))
+    return (deadlines, task_duration)
+
+
 def _per_run_priority_metrics(csv_path: Path) -> pd.DataFrame:
     """Same metrics as `_per_run_metrics` but stratified by `priority`.
 
@@ -254,13 +354,14 @@ def _per_run_priority_metrics(csv_path: Path) -> pd.DataFrame:
             "priority", "n_tasks", "completion_rate", "drop_rate",
             "expired_rate", "preempt_drop_rate",
             "mean_wait", "mean_turnaround", "total_drops", "throughput",
+            "sim_finish_time",
         ])
     sim_duration = float(df["finalizedAt"].max())
     out_rows: List[Dict[str, Any]] = []
     for prio, grp in df.groupby("priority", sort=True):
         completed     = grp["outcome"] == "COMPLETED"
         # Match the aggregate definition: every non-COMPLETED outcome
-        # (DROPPED + EXPIRED + leftover QUEUED/UNFINISHED) is a drop.
+        # (DROPPED + EXPIRED + leftover UNFINISHED) is a drop.
         dropped       = ~completed
         expired       = grp["outcome"] == "EXPIRED"
         preempt_drop  = grp["outcome"] == "DROPPED"
@@ -281,6 +382,7 @@ def _per_run_priority_metrics(csv_path: Path) -> pd.DataFrame:
             "total_drops":       int(grp["dropEvents"].sum()),
             "throughput":        (n_completed / sim_duration
                                   if sim_duration > 0 else float("nan")),
+            "sim_finish_time":   sim_duration,
         })
     return pd.DataFrame(out_rows)
 
@@ -325,9 +427,29 @@ def load_sweep_by_priority(sweep_dir: str | Path) -> pd.DataFrame:
 
     df = pd.DataFrame(rows)
     df["priority"] = df["priority"].astype(int)
+
+    # ---- Normalised metrics ---------------------------------------------
+    # Per-priority queue-wait deadlines and the nominal task duration come
+    # from the sweep manifest. Without them the normalised metrics aren't
+    # meaningful, so we emit NaNs (the plotter just shows empty axes).
+    deadlines, task_duration = _read_priority_budgets(sweep_dir)
+    deadline_series = df["priority"].map(deadlines).astype(float)
+    df["mean_wait_norm"] = df["mean_wait"] / deadline_series
+    denom_turn = (deadline_series + task_duration
+                  if task_duration is not None else deadline_series)
+    df["mean_turnaround_norm"] = df["mean_turnaround"] / denom_turn
+    # throughput_norm = served fraction of the per-class demand
+    #   = (n_completed_in_class / sim_duration) / (n_in_class / sim_duration)
+    #   = n_completed_in_class / n_in_class
+    # which is the per-class completion rate. Equivalent to completion_rate
+    # but exposed as a "throughput" view (1.0 = perfectly served class).
+    df["throughput_norm"] = df["completion_rate"]
+
     df.attrs["sweep_dir"] = str(sweep_dir)
     df.attrs["dims"]       = list(layout.display_dims)
     df.attrs["algorithms"] = list(layout.algorithms)
+    df.attrs["deadlines_by_priority"] = dict(deadlines)
+    df.attrs["task_duration_s"] = task_duration
     return df
 
 
@@ -343,6 +465,10 @@ def _metric_label(metric: str) -> str:
         "total_drops":     "Total drop events",
         "n_tasks":         "Tasks generated",
         "throughput":      "Throughput (completed tasks / s)",
+        "sim_finish_time": "Sim finish time (s)",
+        "mean_wait_norm":       "Mean wait / deadline (fraction)",
+        "mean_turnaround_norm": "Mean turnaround / (deadline + duration) (fraction)",
+        "throughput_norm":      "Throughput / demand (completed / generated)",
     }.get(metric, metric)
 
 
@@ -497,6 +623,133 @@ def _plot_3d_heatmap(
     return fig
 
 
+def _plot_3d_scatter(
+    df: pd.DataFrame,
+    dims: Sequence[str],
+    algorithms: Sequence[str],
+    metric: str,
+) -> Figure:
+    """True 3-D scatter, one axes per algorithm.
+
+    All three swept dimensions occupy the spatial axes (x=`dims[0]`,
+    y=`dims[1]`, z=`dims[2]`); the metric is encoded as point colour with
+    a shared colour bar so FIFO/COST/etc. are directly comparable. Each
+    point is the per-cell mean over repetitions.
+    """
+    # Importing the projection class registers the "3d" projection.
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+    d1, d2, d3 = dims
+    d1_vals = sorted(df[d1].unique())
+    d2_vals = sorted(df[d2].unique())
+    d3_vals = sorted(df[d3].unique())
+
+    agg = (df.groupby(["algorithm", d1, d2, d3])[metric]
+             .mean().reset_index())
+    vmin = float(np.nanmin(agg[metric].values))
+    vmax = float(np.nanmax(agg[metric].values))
+    if vmin == vmax:                  # avoid a degenerate colour scale
+        vmax = vmin + 1e-9
+
+    cmap_name = "viridis_r" if metric in _LOWER_IS_BETTER else "viridis"
+    cmap = plt.get_cmap(cmap_name)
+
+    n = len(algorithms)
+    fig = plt.figure(figsize=(max(4.6 * n, 6.0), 4.8))
+    sc = None
+    for i, algo in enumerate(algorithms):
+        ax = fig.add_subplot(1, n, i + 1, projection="3d")
+        sub = agg[agg["algorithm"] == algo]
+        if not sub.empty:
+            sc = ax.scatter(
+                sub[d1].values, sub[d2].values, sub[d3].values,
+                c=sub[metric].values, cmap=cmap, vmin=vmin, vmax=vmax,
+                s=110, edgecolor="black", linewidths=0.4, depthshade=False,
+            )
+        ax.set_xlabel(d1)
+        ax.set_ylabel(d2)
+        ax.set_zlabel(d3)
+        ax.set_title(algo)
+        ax.set_xticks(d1_vals)
+        ax.set_yticks(d2_vals)
+        ax.set_zticks(d3_vals)
+
+    direction = " (lower is better)" if metric in _LOWER_IS_BETTER else ""
+    fig.suptitle(f"{_metric_label(metric)}{direction}  |  mean over reps")
+    fig.tight_layout(rect=(0, 0, 0.92, 0.94))
+    cbar_ax = fig.add_axes((0.93, 0.15, 0.015, 0.72))
+    if sc is not None:
+        fig.colorbar(sc, cax=cbar_ax, label=_metric_label(metric))
+    return fig
+
+
+def _plot_2d_scatter3d(
+    df: pd.DataFrame,
+    dims: Sequence[str],
+    algorithms: Sequence[str],
+    metric: str,
+) -> Figure:
+    """3-D view of a 2-D sweep: the metric itself is the Z axis.
+
+    All algorithms are overlaid in a single 3-D axes so the surfaces can
+    be compared directly (x = `dims[0]`, y = `dims[1]`, z = mean metric
+    over reps; one colour per algorithm). A thin wireframe per algorithm
+    is drawn under the markers to make the surface shape readable.
+    """
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+    d1, d2 = dims
+    d1_vals = sorted(df[d1].unique())
+    d2_vals = sorted(df[d2].unique())
+
+    agg = (df.groupby(["algorithm", d1, d2])[metric]
+             .mean().reset_index())
+
+    cmap = plt.get_cmap("tab10")
+    colors = {algo: cmap(k % 10) for k, algo in enumerate(algorithms)}
+
+    fig = plt.figure(figsize=(7.5, 5.5))
+    ax = fig.add_subplot(1, 1, 1, projection="3d")
+
+    # Build a (len(d2_vals), len(d1_vals)) mesh grid for the wireframes.
+    X, Y = np.meshgrid(np.asarray(d1_vals, dtype=float),
+                       np.asarray(d2_vals, dtype=float))
+
+    for algo in algorithms:
+        sub = agg[agg["algorithm"] == algo]
+        if sub.empty:
+            continue
+        pivot = (sub.pivot(index=d2, columns=d1, values=metric)
+                    .reindex(index=d2_vals, columns=d1_vals))
+        Z = pivot.values.astype(float)
+        # Wireframe so the shape is legible behind the scatter markers.
+        ax.plot_wireframe(
+            X, Y, Z,
+            color=colors[algo], alpha=0.4, linewidth=0.9,
+        )
+        ax.scatter(
+            sub[d1].values, sub[d2].values, sub[metric].values,
+            color=colors[algo], s=45, edgecolor="black", linewidths=0.3,
+            depthshade=False, label=algo,
+        )
+
+    ax.set_xlabel(d1)
+    ax.set_ylabel(d2)
+    ax.set_zlabel(_metric_label(metric))
+    ax.set_xticks(d1_vals)
+    ax.set_yticks(d2_vals)
+
+    handles = [plt.Line2D([0], [0], color=colors[a], marker="o",
+                          linestyle="-", linewidth=1.5, label=a)
+               for a in algorithms]
+    ax.legend(handles=handles, loc="upper left", frameon=False)
+
+    direction = " (lower is better)" if metric in _LOWER_IS_BETTER else ""
+    fig.suptitle(f"{_metric_label(metric)}{direction}  |  mean over reps")
+    fig.tight_layout()
+    return fig
+
+
 def _plot_line(
     df: pd.DataFrame,
     dims: Sequence[str],
@@ -605,19 +858,30 @@ def plot_sweep(
     sweep_dir : path
         Folder containing the algorithm subfolders (e.g. `sim_data/<label>/`).
     metric : str
-        One of ``completion_rate, drop_rate, mean_wait, mean_turnaround,
-        total_drops, n_tasks, throughput``.
-    kind : {"box", "line"}, default "box"
+        One of ``completion_rate, drop_rate, expired_rate,
+        preempt_drop_rate, mean_wait, mean_turnaround, total_drops,
+        n_tasks, throughput, sim_finish_time``. ``sim_finish_time`` is
+        the wall-clock simulation end (max ``finalizedAt``) and is the
+        right metric for comparing which algorithm drains the workload
+        fastest overall.
+    kind : {"box", "line", "scatter3d"}, default "box"
         Plot style.
           * ``"box"``  -- side-by-side grouped boxplots (one panel per
             algorithm, dim1 on x, dim2 as the box colour group). Shows the
-            full per-rep distribution. Only used for 2-D sweeps; ignored
-            for 3-D (always heatmaps).
+            full per-rep distribution. Only used for 2-D sweeps; for 3-D
+            sweeps it falls back to the heatmap grid (`_plot_3d_heatmap`).
           * ``"line"`` -- simple line chart with all algorithms overlaid
             in the same axes. For 2-D sweeps: one panel per value of dim2,
             x=dim1, one line per algorithm (mean over reps, shaded \u00b1 std).
             For 3-D sweeps: a grid of such line plots (rows = dim2,
             cols = dim3).
+          * ``"scatter3d"`` -- true 3-D axes.
+            For 2-D sweeps: one shared axes with `dim1`/`dim2` on the
+            spatial axes and the metric on Z; algorithms are overlaid in
+            different colours (point + wireframe per algo). For 3-D
+            sweeps: one 3-D axes per algorithm with the three swept
+            dimensions on the spatial axes and the metric encoded as
+            point colour (shared colour bar).
     save : path or None
         If set, save the figure to this path (extension picks the format).
     show : bool
@@ -631,21 +895,27 @@ def plot_sweep(
     if metric not in _VALID_METRICS:
         raise ValueError(
             f"metric={metric!r} not recognised. Options: {_VALID_METRICS}")
-    if kind not in ("box", "line"):
-        raise ValueError(f"kind={kind!r} not recognised. Options: 'box', 'line'")
+    if kind not in ("box", "line", "scatter3d"):
+        raise ValueError(
+            f"kind={kind!r} not recognised. "
+            "Options: 'box', 'line', 'scatter3d'")
 
     df = load_sweep(sweep_dir)
     dims = df.attrs["dims"]
     algorithms = df.attrs["algorithms"]
 
     if len(dims) == 2:
-        if kind == "line":
+        if kind == "scatter3d":
+            fig = _plot_2d_scatter3d(df, dims, algorithms, metric)
+        elif kind == "line":
             fig = _plot_line(df, dims, algorithms, metric)
         else:
             fig = _plot_2d_box(df, dims, algorithms, metric)
     elif len(dims) == 3:
         if kind == "line":
             fig = _plot_line(df, dims, algorithms, metric)
+        elif kind == "scatter3d":
+            fig = _plot_3d_scatter(df, dims, algorithms, metric)
         else:
             fig = _plot_3d_heatmap(df, dims, algorithms, metric)
     else:
@@ -886,9 +1156,10 @@ def plot_by_priority(
         ``"pooled"`` view to a single operating point.
     save, show : as in `plot_sweep`.
     """
-    if metric not in _VALID_METRICS:
+    valid = _VALID_METRICS + _VALID_PRIORITY_ONLY_METRICS
+    if metric not in valid:
         raise ValueError(
-            f"metric={metric!r} not recognised. Options: {_VALID_METRICS}")
+            f"metric={metric!r} not recognised. Options: {valid}")
     if kind not in ("grid", "pooled"):
         raise ValueError(
             f"kind={kind!r} not recognised. Options: 'grid', 'pooled'")
