@@ -406,6 +406,69 @@ Missing `taskDeadlineWeights` => the wait/turnaround normalised columns
 come out as `NaN`. Missing `taskDuration` falls back to dividing the
 turnaround by just the deadline.
 
+### Tabular summaries + priority-weighted ranking
+
+Two non-plotting helpers reduce a sweep to tables (used heavily by
+[algo_research.ipynb](algo_research.ipynb)):
+
+```python
+from sweep_plotter import summarize_sweep, score_sweep
+
+# Mean-over-reps table, one row per algorithm (or per `by` group).
+summarize_sweep("sim_data/baseline_combat",
+                metrics=["completion_rate", "drop_rate", "mean_wait"])
+# Slice to one operating point and keep a dim un-collapsed:
+summarize_sweep("sim_data/load_combat",
+                where={"numMbs": 3, "taskGenerationInterval": "exponential(15s)"},
+                by=("algorithm", "numDrones"))
+
+# Priority-weighted composite ranking (row 0 = winning cell).
+score_sweep("sim_data/baseline_combat")            # ramp HIGH=3, MID=2, LOW=1
+score_sweep("sim_data/baseline_combat", priority_weights=(1, 1, 1))  # plain aggregate
+```
+
+- **`summarize_sweep(sweep_dir, metrics=…, where=None, by=("algorithm",))`** —
+  averages the requested aggregate metrics over reps within each `by` group.
+  `where=` is an exact-match slice on the cleaned dim names; `by=` controls the
+  grouping. Returns one row per group plus `n_tasks` / `n_runs`.
+- **`score_sweep(sweep_dir, priority_weights=(3,2,1), w_drop=1.0, w_wait=1.5,
+  wait_budget=120.0)`** — per-cell **priority-weighted composite**:
+  `wcompletion = Σ_p w_p·n_completed_p / Σ_p w_p·n_generated_p` (and `wdrop`
+  analogously), then
+  `score = wcompletion − w_drop·wdrop − w_wait·(mean_wait / wait_budget)`.
+  The importance ramp `w_p` (default `priorityLevels+1−p` → HIGH=3, MID=2,
+  LOW=1) makes completing a HIGH task count more than a LOW one — the right
+  lens when priorities matter. `wait_budget` (seconds) normalises latency into
+  a 0..1 penalty: a cell whose `mean_wait` equals the budget loses exactly
+  `w_wait` (default budget = the 120 s MID-class deadline). Pass equal weights
+  to recover plain aggregate completion/drop. Sorted by `score` descending.
+
+### Recommended per-scenario COST weights
+
+The research notebook starts every scenario from a single deliberately **naive /
+untuned** COST configuration — `costEnergyWeight=0`, `costMbsRelocationWeight=0`,
+`costHaltPriorityWeights="100 50 10"`, `costHaltGroupSizeWeight=500` (the "before
+research" baseline) — and then tunes the COST knobs per scenario (at
+`drone_comm_range = 150 m`). Tuning lifts COST from worst-ish (last in combat,
+3rd elsewhere) to the composite leader at the nominal operating point
+(Δ **+0.12 to +0.23** in every scenario):
+
+| Scenario | `costEnergyWeight` | `costMbsRelocationWeight` | `costHaltPriorityWeights` | `costHaltGroupSizeWeight` |
+|---|---|---|---|---|
+| Policing (LOW-heavy `1 2 7`)  | `1.0` | `2.0` | `"2000 1000 200"` | `0`  |
+| Disaster (MID-heavy `3 6 1`)  | `2.0` | `0.5` | `"1000 500 100"`  | `0`  |
+| Combat (HIGH-heavy `7 2 1`)   | `2.0` | `0.5` | `"2000 1000 200"` | `50` |
+
+Rules of thumb from the sweeps (with latency weighted 1.5× the drop rate,
+`w_wait=1.5`): the tuning tilts toward *responsiveness*. From the naive set the
+consistent corrections are to **raise `costEnergyWeight` off zero** (suppress
+wasteful hops, shorten waits), **allow relocation** (raise
+`costMbsRelocationWeight` so idle MBSs cover new work), adopt a **steep halt
+ladder** (`"2000 1000 200"` / `"1000 500 100"`, protecting in-progress important
+work), and **drop the oversized group-size penalty** to ~0. Policing needs the
+biggest correction; all three move the same direction. See
+[algo_research.ipynb](algo_research.ipynb) for the full analysis.
+
 ---
 
 ## 6. Key files

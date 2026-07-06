@@ -454,6 +454,150 @@ def load_sweep_by_priority(sweep_dir: str | Path) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Tabular summaries / ranking
+# ---------------------------------------------------------------------------
+_SUMMARY_DEFAULT_METRICS = (
+    "completion_rate",
+    "drop_rate",
+    "expired_rate",
+    "mean_wait",
+    "mean_turnaround",
+)
+
+
+def _apply_where(df: pd.DataFrame, where: Optional[Dict[str, Any]]) -> pd.DataFrame:
+    """Filter a long-format sweep df by exact matches on cleaned dim columns.
+
+    `where` keys are cleaned dim names (e.g. ``numMbs``,
+    ``taskGenerationInterval``); values must match the stored value exactly
+    (same string the sweep wrote, e.g. ``"exponential(15s)"``).
+    """
+    if not where:
+        return df
+    mask = pd.Series(True, index=df.index)
+    for key, val in where.items():
+        if key not in df.columns:
+            raise KeyError(
+                f"where key {key!r} is not a sweep dimension; "
+                f"available: {[c for c in df.columns]}")
+        mask &= (df[key] == val)
+    out = df[mask]
+    if out.empty:
+        raise ValueError(f"where={where!r} selected no rows")
+    return out
+
+
+def summarize_sweep(
+    sweep_dir: str | Path,
+    metrics: Sequence[str] = _SUMMARY_DEFAULT_METRICS,
+    where: Optional[Dict[str, Any]] = None,
+    by: Sequence[str] | str = ("algorithm",),
+) -> pd.DataFrame:
+    """Mean-over-reps summary table for a sweep folder.
+
+    Loads the aggregate per-run metrics (`load_sweep`), optionally slices to a
+    single operating point via ``where``, then averages the requested
+    ``metrics`` within each ``by`` group (default: one row per algorithm).
+
+    Parameters
+    ----------
+    sweep_dir : path to a run_sweep output folder.
+    metrics : aggregate metric columns to average (see `_per_run_metrics`).
+    where : optional {dim: value} slice on the cleaned sweep dimensions.
+    by : grouping columns; defaults to ``("algorithm",)``. Pass extra dims
+        (e.g. ``("algorithm", "numDrones")``) to keep them un-collapsed.
+
+    Returns
+    -------
+    DataFrame indexed by the ``by`` columns with one column per metric
+    (plus ``n_tasks`` and ``n_runs`` for context).
+    """
+    if isinstance(by, str):
+        by = (by,)
+    by = list(by)
+    df = load_sweep(sweep_dir)
+    df = _apply_where(df, where)
+    metrics = [m for m in metrics if m in df.columns]
+    agg_cols = metrics + (["n_tasks"] if "n_tasks" in df.columns else [])
+    grouped = df.groupby(by, dropna=False)
+    out = grouped[agg_cols].mean()
+    out["n_runs"] = grouped.size()
+    return out.reset_index()
+
+
+def score_sweep(
+    sweep_dir: str | Path,
+    priority_weights: Sequence[float] = (3, 2, 1),
+    w_drop: float = 1.0,
+    w_wait: float = 1.5,
+    wait_budget: float = 120.0,
+) -> pd.DataFrame:
+    """Rank every (algorithm, cell) by a priority-weighted composite score.
+
+    The score rewards completing important tasks, penalises drops, and
+    penalises latency::
+
+        wcompletion = sum_p( w_p * n_completed_p ) / sum_p( w_p * n_generated_p )
+        wdrop       = sum_p( w_p * n_dropped_p   ) / sum_p( w_p * n_generated_p )
+        score       = wcompletion - w_drop * wdrop - w_wait * (mean_wait / wait_budget)
+
+    where ``w_p`` is the per-class importance from ``priority_weights``
+    (index 0 = priority 1 = HIGH). Completion/drop counts are pooled across
+    reps (sum of per-class ``completion_rate * n_tasks``); ``mean_wait`` is the
+    aggregate dispatched-task mean wait per cell (from `load_sweep`).
+
+    Parameters
+    ----------
+    priority_weights : per-class importance ramp; default ``(3, 2, 1)`` =
+        ``priorityLevels + 1 - p``. Pass equal weights (e.g. ``(1, 1, 1)``)
+        to recover the plain aggregate completion/drop.
+    w_drop, w_wait : penalty weights for drop fraction and latency.
+    wait_budget : seconds that map to a full ``w_wait`` latency penalty; a
+        cell whose ``mean_wait == wait_budget`` loses exactly ``w_wait``.
+        Default 120s = the MID-class deadline. Smaller budget => latency
+        dominates the ranking.
+
+    Returns
+    -------
+    DataFrame with columns ``algorithm``, the sweep dims, ``wcompletion``,
+    ``wdrop``, ``mean_wait``, ``score`` -- sorted by ``score`` descending
+    (row 0 is the winning cell).
+    """
+    dfp = load_sweep_by_priority(sweep_dir)
+    dims = list(dfp.attrs.get("dims", []))
+    keys = ["algorithm"] + dims
+
+    weight_for = {
+        i + 1: float(w) for i, w in enumerate(priority_weights)
+    }
+    w = dfp["priority"].map(weight_for).fillna(1.0).astype(float)
+    n_gen = dfp["n_tasks"].astype(float)
+    n_comp = dfp["completion_rate"].astype(float) * n_gen
+    n_drop = dfp["drop_rate"].astype(float) * n_gen
+
+    work = dfp[keys].copy()
+    work["_wgen"] = w * n_gen
+    work["_wcomp"] = w * n_comp
+    work["_wdrop"] = w * n_drop
+    pooled = work.groupby(keys, dropna=False)[["_wgen", "_wcomp", "_wdrop"]].sum()
+    pooled["wcompletion"] = pooled["_wcomp"] / pooled["_wgen"]
+    pooled["wdrop"] = pooled["_wdrop"] / pooled["_wgen"]
+
+    # Aggregate latency per cell from the (non-stratified) loader.
+    agg = load_sweep(sweep_dir)
+    wait = agg.groupby(keys, dropna=False)["mean_wait"].mean()
+
+    out = pooled[["wcompletion", "wdrop"]].join(wait)
+    out["score"] = (
+        out["wcompletion"]
+        - w_drop * out["wdrop"]
+        - w_wait * (out["mean_wait"] / wait_budget)
+    )
+    out = out.reset_index().sort_values("score", ascending=False, ignore_index=True)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Plot helpers
 # ---------------------------------------------------------------------------
 def _metric_label(metric: str) -> str:
@@ -818,8 +962,14 @@ def _plot_line(
 
         ax.grid(linestyle=":", alpha=0.5)
         if panel_dims:
-            title_bits = [f"{pd_name}={pd_val}"
-                          for pd_name, pd_val in zip(panel_dims, combo)]
+            # For the task-load dimension the value is already a self-describing
+            # RV distribution (e.g. "exponential(30s)"), so drop the verbose
+            # "taskGenerationInterval=" prefix to keep panel titles short.
+            title_bits = [
+                f"{pd_val}" if pd_name == "taskGenerationInterval"
+                else f"{pd_name}={pd_val}"
+                for pd_name, pd_val in zip(panel_dims, combo)
+            ]
             ax.set_title(" | ".join(title_bits), fontsize=10)
         if r == n_rows - 1:
             ax.set_xlabel(d1)
@@ -848,6 +998,7 @@ def plot_sweep(
     metric: str = "completion_rate",
     *,
     kind: str = "box",
+    where: Optional[Dict[str, Any]] = None,
     save: Optional[str | Path] = None,
     show: bool = True,
 ) -> Tuple[Figure, pd.DataFrame]:
@@ -882,6 +1033,11 @@ def plot_sweep(
             sweeps: one 3-D axes per algorithm with the three swept
             dimensions on the spatial axes and the metric encoded as
             point colour (shared colour bar).
+    where : dict or None
+        Optional slice on the cleaned sweep dimensions (e.g.
+        ``{"numMbs": 3}``). Matching rows are kept and the fixed dims are
+        dropped, so a 3-D sweep can be viewed as a 2-D plane. Values must
+        match exactly (same string the sweep wrote).
     save : path or None
         If set, save the figure to this path (extension picks the format).
     show : bool
@@ -901,8 +1057,19 @@ def plot_sweep(
             "Options: 'box', 'line', 'scatter3d'")
 
     df = load_sweep(sweep_dir)
-    dims = df.attrs["dims"]
+    dims = list(df.attrs["dims"])
     algorithms = df.attrs["algorithms"]
+
+    # Optional slice: filter rows to the given dim values and drop those dims,
+    # reducing the sweep's dimensionality (e.g. a 3-D sweep sliced on numMbs=3
+    # becomes the 2-D numDrones x gen plane).
+    if where:
+        df = _apply_where(df, where)
+        dims = [d for d in dims if d not in where]
+        if len(dims) not in (2, 3):
+            raise ValueError(
+                f"after where={where!r} the sweep has {len(dims)} free "
+                "dimension(s); plot_sweep needs 2 or 3. Slice fewer dims.")
 
     if len(dims) == 2:
         if kind == "scatter3d":

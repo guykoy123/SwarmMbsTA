@@ -610,12 +610,12 @@ def _run_single_sweep(
         cell_dir = sweep_dir.joinpath(*cell_path_parts)
         ini_path = _write_cell_ini(cell_dir, cell_overrides, extra_overrides,
                                    repetitions)
-        logger.info("[cell] %s", " | ".join(cell_path_parts))
+        logger.debug("[cell] %s", " | ".join(cell_path_parts))
 
         for rep in range(repetitions):
             run_idx += 1
-            logger.info("  -> run %d/%d (rep=%d) starting",
-                        run_idx, total_runs, rep)
+            logger.debug("  -> run %d/%d (rep=%d) starting",
+                         run_idx, total_runs, rep)
             ok, secs, log_path = _run_one(ini_path, cell_dir, rep, timeout_sec)
             csv_name = f"rep{rep}-tasks.csv"
             csv_path = cell_dir / csv_name
@@ -636,8 +636,8 @@ def _run_single_sweep(
                 logger.warning("     OK (%.2fs) but CSV missing at %s",
                                secs, csv_path.relative_to(sweep_dir))
             else:
-                logger.info("     ok (%.2fs) -> %s",
-                            secs, csv_path.relative_to(sweep_dir))
+                logger.debug("     ok (%.2fs) -> %s",
+                             secs, csv_path.relative_to(sweep_dir))
 
     elapsed = time.monotonic() - start_wall
     logger.info("Sweep done in %.1fs (%d/%d failed)",
@@ -657,18 +657,47 @@ def _run_single_sweep(
 # ---------------------------------------------------------------------------
 # Logging setup -- file + console, idempotent across re-imports
 # ---------------------------------------------------------------------------
+# Console verbosity for the per-sweep logger. The per-cell / per-run lines are
+# logged at DEBUG so they always land in `sweep.log` but, by default, never
+# spam stdout (important inside notebooks: thousands of "run k/N ... ok" lines
+# bloat the .ipynb and slow rendering). Raise to logging.DEBUG to see every run
+# on the console, or call `set_console_log_level("WARNING")` to show failures
+# only.
+_CONSOLE_LOG_LEVEL = logging.INFO
+
+
+def set_console_log_level(level) -> None:
+    """Set how chatty run_sweep is on stdout (file logs are always full).
+
+    `level` may be a logging constant (e.g. ``logging.WARNING``) or a name
+    (``"INFO"``, ``"WARNING"``, ``"DEBUG"``). Per-run/per-cell lines are DEBUG,
+    so ``"INFO"`` (default) shows just the start/summary of each sweep and any
+    failures; ``"WARNING"`` shows failures only; ``"DEBUG"`` shows everything.
+    """
+    global _CONSOLE_LOG_LEVEL
+    if isinstance(level, str):
+        level = getattr(logging, level.upper())
+    _CONSOLE_LOG_LEVEL = level
+    for h in logger.handlers:
+        if type(h) is logging.StreamHandler:   # console handler, not the file
+            h.setLevel(level)
+
+
 def _configure_top_log(log_path: Path) -> None:
     # Remove any handlers from a previous call so re-imports don't pile up.
     for h in list(logger.handlers):
         logger.removeHandler(h)
-    logger.setLevel(logging.INFO)
+    # Logger passes everything through; the handlers decide what to emit.
+    logger.setLevel(logging.DEBUG)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s",
                             datefmt="%H:%M:%S")
     fh = logging.FileHandler(log_path, mode="w")
     fh.setFormatter(fmt)
+    fh.setLevel(logging.DEBUG)               # full detail always in sweep.log
     logger.addHandler(fh)
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
+    sh.setLevel(_CONSOLE_LOG_LEVEL)          # quiet on stdout by default
     logger.addHandler(sh)
 
 
