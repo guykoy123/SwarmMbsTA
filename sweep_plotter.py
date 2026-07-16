@@ -610,9 +610,9 @@ def _metric_label(metric: str) -> str:
         "n_tasks":         "Tasks generated",
         "throughput":      "Throughput (completed tasks / s)",
         "sim_finish_time": "Sim finish time (s)",
-        "mean_wait_norm":       "Mean wait / deadline (fraction)",
-        "mean_turnaround_norm": "Mean turnaround / (deadline + duration) (fraction)",
-        "throughput_norm":      "Throughput / demand (completed / generated)",
+        "mean_wait_norm":       "Normalized mean wait (wait / deadline)",
+        "mean_turnaround_norm": "Normalized mean turnaround (turnaround / (deadline + duration))",
+        "throughput_norm":      "Normalized throughput (completed / generated)",
     }.get(metric, metric)
 
 
@@ -899,6 +899,7 @@ def _plot_line(
     dims: Sequence[str],
     algorithms: Sequence[str],
     metric: str,
+    title_suffix: str = "",
 ) -> Figure:
     """Line plot: x = dims[0], one line per algorithm, panels for dims[1:].
 
@@ -984,7 +985,8 @@ def _plot_line(
                bbox_to_anchor=(0.5, 1.02), frameon=False)
 
     direction = " (lower is better)" if metric in _LOWER_IS_BETTER else ""
-    fig.suptitle(f"{_metric_label(metric)}{direction}  |  mean \u00b1 std over reps",
+    fig.suptitle(f"{_metric_label(metric)}{direction}{title_suffix}"
+                 "  |  mean \u00b1 std over reps",
                  y=1.06)
     fig.tight_layout()
     return fig
@@ -1285,6 +1287,16 @@ def _plot_priority_grid(
     return fig
 
 
+# Class names for the standard 3-level priority scheme (1 = most urgent).
+_PRIORITY_CLASS_NAMES = {1: "HIGH", 2: "MID", 3: "LOW"}
+
+
+def _priority_panel_label(p: int, priorities: Sequence[int]) -> str:
+    if set(priorities) <= set(_PRIORITY_CLASS_NAMES):
+        return f"priority={p} ({_PRIORITY_CLASS_NAMES[p]})"
+    return f"priority={p}"
+
+
 def plot_by_priority(
     sweep_dir: str | Path,
     metric: str = "completion_rate",
@@ -1293,7 +1305,7 @@ def plot_by_priority(
     where: Optional[Dict[str, Any]] = None,
     save: Optional[str | Path] = None,
     show: bool = True,
-) -> Tuple[Figure, pd.DataFrame]:
+) -> Tuple[Figure | List[Figure], pd.DataFrame]:
     """Compare allocators broken out by task priority class.
 
     Parameters
@@ -1304,7 +1316,7 @@ def plot_by_priority(
         One of `_VALID_METRICS`. Computed PER priority class within each
         rep (e.g. ``completion_rate`` for priority=1 is the fraction of
         priority-1 tasks that completed in that run).
-    kind : {"grid", "pooled"}, default "grid"
+    kind : {"grid", "pooled", "matrix"}, default "grid"
         How to fold the sweep dimensions into the figure.
           * ``"grid"``   -- one panel per sweep cell; inside each panel
             x=priority, one line per algorithm (mean \u00b1 std over reps).
@@ -1316,20 +1328,29 @@ def plot_by_priority(
             per priority, distribution pooled across the whole sweep (or
             whatever `where` filtered down to). Loses the per-cell detail
             but is compact.
+          * ``"matrix"`` -- one figure PER priority class, each laid out
+            exactly like the aggregate ``plot_sweep(..., kind="line")``
+            graph matrix (x = dim1, panel rows = dim2, panel cols = dim3,
+            one line per algorithm, mean \u00b1 std over reps). Use this to
+            read a per-class metric across the full sweep the same way as
+            the aggregate metrics. Returns a list of figures.
     where : dict or None
         Optional filter to pin specific sweep dims, e.g.
         ``where={"numDrones": 20, "numMbs": 5}``. Useful for shrinking the
-        ``"grid"`` view to a handful of cells, or for pinning the
-        ``"pooled"`` view to a single operating point.
-    save, show : as in `plot_sweep`.
+        ``"grid"``/``"matrix"`` views to a handful of cells, or for pinning
+        the ``"pooled"`` view to a single operating point.
+    save : path or None
+        As in `plot_sweep`. For ``kind="matrix"`` the priority class is
+        suffixed to the file stem (e.g. ``foo_p1.png``, ``foo_p2.png``).
+    show : as in `plot_sweep`.
     """
     valid = _VALID_METRICS + _VALID_PRIORITY_ONLY_METRICS
     if metric not in valid:
         raise ValueError(
             f"metric={metric!r} not recognised. Options: {valid}")
-    if kind not in ("grid", "pooled"):
+    if kind not in ("grid", "pooled", "matrix"):
         raise ValueError(
-            f"kind={kind!r} not recognised. Options: 'grid', 'pooled'")
+            f"kind={kind!r} not recognised. Options: 'grid', 'pooled', 'matrix'")
 
     df = load_sweep_by_priority(sweep_dir)
     dims = df.attrs["dims"]
@@ -1346,19 +1367,38 @@ def plot_by_priority(
         if df.empty:
             raise RuntimeError(f"where={where} matched no rows")
 
+    remaining_dims = [d for d in dims if not (where and d in where)]
+
     if kind == "pooled":
-        fig = _plot_priority_pooled(df, algorithms, metric, dims, where)
+        figs: List[Figure] = [
+            _plot_priority_pooled(df, algorithms, metric, dims, where)]
+    elif kind == "matrix":
+        # One aggregate-style line matrix per priority class.
+        priorities = sorted(df["priority"].unique())
+        figs = [
+            _plot_line(
+                df[df["priority"] == p], remaining_dims, algorithms, metric,
+                title_suffix=f"  |  {_priority_panel_label(p, priorities)}",
+            )
+            for p in priorities
+        ]
     else:
         # If `where` pinned every sweep dim down to one value the grid
         # collapses to a single panel -- that's fine.
-        remaining_dims = [d for d in dims if not (where and d in where)]
-        fig = _plot_priority_grid(df, remaining_dims, algorithms, metric)
+        figs = [_plot_priority_grid(df, remaining_dims, algorithms, metric)]
 
     if save is not None:
         save = Path(save).expanduser()
         save.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(save, bbox_inches="tight", dpi=120)
-        logger.info("saved figure to %s", save)
+        if len(figs) == 1:
+            figs[0].savefig(save, bbox_inches="tight", dpi=120)
+            logger.info("saved figure to %s", save)
+        else:
+            priorities = sorted(df["priority"].unique())
+            for p, fig in zip(priorities, figs):
+                path = save.with_stem(f"{save.stem}_p{p}")
+                fig.savefig(path, bbox_inches="tight", dpi=120)
+                logger.info("saved figure to %s", path)
     if show:
         plt.show()
-    return fig, df
+    return (figs[0] if len(figs) == 1 else figs), df
